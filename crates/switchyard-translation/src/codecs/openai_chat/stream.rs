@@ -48,10 +48,22 @@ fn decode_openai_chat_stream(
     event: &Value,
 ) -> Vec<LlmResponseChunk> {
     let Some(object) = event.as_object() else {
-        return vec![LlmResponseChunk::Error {
+        return vec![LlmResponseChunk::DecodeError {
             message: "OpenAI stream event is not an object".to_string(),
         }];
     };
+
+    // Upstream error frames carry no choices, so without this they would decode to a bare
+    // `MessageStart` and the error text would be dropped.
+    if let Some(error) = object.get("error") {
+        return vec![LlmResponseChunk::StreamError {
+            message: error
+                .get("message")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown OpenAI stream error")
+                .to_string(),
+        }];
+    }
 
     let mut out = Vec::new();
     if !state.saw_message_start {
@@ -204,7 +216,9 @@ fn encode_openai_chat_stream(
                 Some(openai_usage_value(state)),
             )]
         }
-        LlmResponseChunk::Error { message } => vec![json!({"error": {"message": message}})],
+        LlmResponseChunk::DecodeError { message } | LlmResponseChunk::StreamError { message } => {
+            vec![json!({"error": {"message": message}})]
+        }
     }
 }
 
