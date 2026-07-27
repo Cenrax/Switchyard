@@ -239,6 +239,11 @@ classifier_target = "classifier"
 strong_target = "strong"
 weak_target = "weak"
 threshold = 0.5
+
+[routes.passthrough]
+id = "switchyard/passthrough"
+type = "passthrough"
+target = "weak"
 "#,
         base_url = upstream.base_url
     ))?;
@@ -247,6 +252,7 @@ threshold = 0.5
     for (route, selected) in [
         ("switchyard/random", "model/weak"),
         ("switchyard/classifier", "model/strong"),
+        ("switchyard/passthrough", "model/weak"),
     ] {
         let response = send(
             &app,
@@ -269,10 +275,11 @@ threshold = 0.5
     }
 
     let calls = upstream.calls.lock().await;
-    assert_eq!(calls.len(), 3);
+    assert_eq!(calls.len(), 4);
     assert_eq!(calls[0]["model"], "model/weak");
     assert_eq!(calls[1]["model"], "model/classifier");
     assert_eq!(calls[2]["model"], "model/strong");
+    assert_eq!(calls[3]["model"], "model/weak");
     Ok(())
 }
 

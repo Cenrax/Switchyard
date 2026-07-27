@@ -8,7 +8,7 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use libsy::algorithms::{LlmClassifier, Noop, Random};
+use libsy::algorithms::{LlmClassifier, Noop, Passthrough, Random};
 use libsy::{Algorithm, LlmTarget, LlmTargetSet, RoutedLlmClient};
 use serde::Deserialize;
 use switchyard_llm_client::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
@@ -171,6 +171,10 @@ enum RouteConfig {
         weights: Option<Vec<f64>>,
         seed: Option<u64>,
     },
+    Passthrough {
+        id: String,
+        target: String,
+    },
     LlmClassifier {
         id: String,
         classifier_target: String,
@@ -182,8 +186,11 @@ enum RouteConfig {
 
 impl RouteConfig {
     fn id(&self) -> &str {
+        use RouteConfig::*;
         match self {
-            Self::Noop { id } | Self::Random { id, .. } | Self::LlmClassifier { id, .. } => id,
+            Noop { id } | Random { id, .. } | LlmClassifier { id, .. } | Passthrough { id, .. } => {
+                id
+            }
         }
     }
 }
@@ -247,6 +254,10 @@ fn build_algorithm(
             let algorithm = Random::new(target_set, weights.clone(), *seed)
                 .map_err(|error| ServerError::new(format!("random route {route_name}: {error}")))?;
             Ok(Arc::new(algorithm))
+        }
+        RouteConfig::Passthrough { target, .. } => {
+            let target = resolve_target(route_name, target, targets)?;
+            Ok(Arc::new(Passthrough::new(target)))
         }
         RouteConfig::LlmClassifier {
             classifier_target,
@@ -355,6 +366,11 @@ classifier_target = "classifier"
 strong_target = "strong"
 weak_target = "weak"
 threshold = 0.5
+
+[routes.passthrough]
+id = "switchyard/passthrough"
+type = "passthrough"
+target = "weak"
 "#;
 
     fn error_message(toml: &str) -> String {
@@ -367,12 +383,14 @@ threshold = 0.5
     #[test]
     fn builds_all_supported_algorithm_types() -> ServerResult<()> {
         let state = server_state_from_toml(VALID_CONFIG)?;
+        // The model id array is sorted alphabetically
         assert_eq!(
             state.models().collect::<Vec<_>>(),
             [
                 "switchyard/classifier",
                 "switchyard/noop",
-                "switchyard/random"
+                "switchyard/passthrough",
+                "switchyard/random",
             ]
         );
         Ok(())

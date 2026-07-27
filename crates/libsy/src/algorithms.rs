@@ -9,11 +9,13 @@
 pub mod fall_through;
 pub mod llm_class;
 pub mod noop;
+pub mod passthrough;
 pub mod rand;
 
 pub use fall_through::{FallThrough, FallThroughDecision};
 pub use llm_class::{ClassifierDecision, ClassifierTier, LlmClassifier};
 pub use noop::{Noop, NoopDecision};
+pub use passthrough::{Passthrough, PassthroughDecision};
 pub use rand::{Random, RandomDecision};
 pub use util::{AffinityRouter, SubagentOverride};
 
