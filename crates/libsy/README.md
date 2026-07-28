@@ -262,12 +262,28 @@ boundary — so algorithms carry no telemetry code beyond `Algorithm::name()`, t
   their own transport should span their `RoutedLlmClient` equivalently.
 - **Structured logs** (`tracing`, target `libsy`): an info event per published
   `Decision` (selected model + reasoning), warn events for failed calls and runs.
-- **Metrics** (OpenTelemetry, scope `libsy`, via the global meter provider): counters
-  `libsy.runs`, `libsy.llm_calls`, `libsy.decisions`, `libsy.input_tokens`,
-  `libsy.output_tokens`, `libsy.total_tokens`, `libsy.reasoning_tokens`; histograms
-  `libsy.run_duration_ms`, `libsy.llm_call_duration_ms`. Attributes are `algorithm`,
-  `selected_model`, and `outcome` (`ok`/`error`) — failure rates are the
+- **Metrics** (OpenTelemetry, scope `switchyard`, via the global meter provider): counters
+  `switchyard.runs`, `switchyard.llm_calls`, `switchyard.decisions`,
+  `switchyard.input_tokens`, `switchyard.output_tokens`, `switchyard.total_tokens`,
+  `switchyard.reasoning_tokens`; histograms `switchyard.run_duration_ms` and
+  `switchyard.llm_call_duration_ms`. Attributes are `algorithm`, `selected_model`, and
+  `outcome` (`ok`/`error`) — failure rates are the
   `outcome="error"` share of runs/calls.
+
+libsy also records compatibility metrics for final routed calls:
+
+| OpenTelemetry instrument | Prometheus family | Type | Labels | Meaning |
+|---|---|---|---|---|
+| `switchyard.total_requests` | `switchyard_total_requests` | gauge | none | Successful and failed routed calls |
+| `switchyard.total_errors` | `switchyard_total_errors` | gauge | none | Failed routed calls |
+| `switchyard.requests` | `switchyard_requests_total` | counter | `model`, optional `tier` | Successful routed calls |
+| `switchyard.errors` | `switchyard_errors_total` | counter | `model`, optional `tier` | Failed routed calls |
+| `switchyard.model_call_latency_ms` | `switchyard_model_call_latency_ms` | histogram | `model`, optional `tier` | Successful routed-call latency |
+
+Classifier calls remain visible in the general LLM-call instruments but are excluded from these
+compatibility families. The `tier` label is present only when a decision supplies a stable tier.
+Hosts that need the two zero-valued gauges before the first call must invoke
+`libsy::initialize_metrics()` after installing the global meter provider.
 
 libsy owns no exporter. The host installs an OpenTelemetry SDK meter provider
 (`opentelemetry::global::set_meter_provider`) and a `tracing` subscriber (bridge spans

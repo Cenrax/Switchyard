@@ -28,11 +28,16 @@ use crate::{
 pub struct FallThroughDecision {
     model: String,
     reason: String,
+    tier: Option<&'static str>,
 }
 
 impl Decision for FallThroughDecision {
     fn selected_model(&self) -> &str {
         &self.model
+    }
+
+    fn routing_tier(&self) -> Option<&str> {
+        self.tier
     }
 
     fn reasoning(&self) -> Option<&str> {
@@ -119,30 +124,33 @@ impl Algorithm<SharedState> for FallThrough {
 
         // 2. Fall through the cascade: the first classifier to score decides (argmax). The
         //    per-request driver is offered to each — driver-backed classifiers use it.
-        let mut winner: Option<Score> = None;
+        let mut maybe_score: Option<Score> = None;
+        let mut maybe_tier: Option<&'static str> = None;
         for classifier in &self.classifiers {
             let scores = classifier
                 .score(&mut state, &mut request, Some(&driver))
                 .await?;
-            if let Some(score) = scores.argmax(false)? {
-                winner = Some(score);
+            maybe_score = scores.argmax(false)?;
+            if let Some(s) = maybe_score.as_ref() {
+                maybe_tier = classifier.routing_tier(&s.target);
                 break;
             }
         }
-        let Some(winner) = winner else {
+        let Some(score) = maybe_score else {
             return Err(LibsyError::AlgorithmError {
                 message: "every classifier abstained".to_string(),
             });
         };
 
         // 3. Resolve the target and publish the decision.
-        let target = self.targets.get_target(&winner.target)?;
+        let target = self.targets.get_target(&score.target)?;
         let decision: Arc<dyn Decision> = Arc::new(FallThroughDecision {
-            model: winner.target.clone(),
+            model: score.target.clone(),
             reason: format!(
                 "fall-through selected {} (confidence {:.3})",
-                winner.target, winner.confidence
+                score.target, score.confidence
             ),
+            tier: maybe_tier,
         });
         driver.info(ctx.without_state(), decision.clone()).await?;
 
