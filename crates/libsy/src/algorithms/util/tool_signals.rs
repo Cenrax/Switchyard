@@ -11,8 +11,15 @@
 //!
 //! All logic is pure and deterministic — no I/O, no shared state.
 
+#![allow(dead_code)]
+
+use async_trait::async_trait;
 use serde_json::Value;
 use switchyard_protocol::{Request, WireFormat};
+
+use crate::Result;
+
+use crate::{Event, Processor, State};
 
 // ─── severity constants ───────────────────────────────────────────────────────
 
@@ -176,11 +183,11 @@ static NUMERIC_FAILURE_KEYWORDS: &[&str] = &["failed", "failure", "failures", "e
 
 /// Default sliding-window size for `recent_*` counts and windowed severity.
 ///
-/// A 5-call horizon captures "what is the agent doing right now" while keeping
+/// A short horizon captures "what is the agent doing right now" while keeping
 /// signals sticky — an error or stall persists a few recovery turns instead of
 /// flickering off the moment one clean result lands. Override per-extractor by
 /// calling [`extract_tool_signals_with_window`] directly.
-pub const DEFAULT_RECENT_WINDOW: usize = 5;
+pub const DEFAULT_RECENT_WINDOW: usize = 3;
 
 // ─── output type ─────────────────────────────────────────────────────────────
 
@@ -247,6 +254,34 @@ enum ToolCategory {
     Read,
     Plan,
     Other,
+}
+
+/// Request-side processor that extracts tool-result signals from each request
+/// and stores them on the request `State` for downstream routing.
+#[derive(Debug, Clone)]
+pub struct ToolSignalProcessor {
+    /// Number of trailing tool results the `recent_*` counts and windowed
+    /// severity are computed over.
+    pub recent_window: usize,
+}
+
+impl Default for ToolSignalProcessor {
+    fn default() -> Self {
+        Self {
+            recent_window: DEFAULT_RECENT_WINDOW,
+        }
+    }
+}
+
+#[async_trait]
+impl Processor for ToolSignalProcessor {
+    async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
+        if let Event::Request(req) = event {
+            let tool_signal = ToolSignals::from_request(req, Some(self.recent_window));
+            state.tool_signals = Some(tool_signal);
+        }
+        Ok(())
+    }
 }
 
 fn classify_tool_call(name: &str, command: Option<&str>) -> ToolCategory {
@@ -879,8 +914,8 @@ mod tests {
 
     #[test]
     fn recent_window_counts_only_last_default_window_tool_calls() {
-        // 5 writes + 1 edit at the end → the default window (5) should see
-        // the last 5 calls: 1 edit + 4 writes (not all 6 calls).
+        // 5 writes + 1 edit at the end → the default window (3) should see
+        // the last 3 calls: 1 edit + 2 writes (not all 6 calls).
         let request = openai_chat_request(json!({
             "messages": [
                 {"role": "assistant", "tool_calls": [{"function": {"name": "Write"}}]},
@@ -900,7 +935,7 @@ mod tests {
         let sig = ToolSignals::from_request(&request, None);
         assert_eq!(sig.write_count, 5);
         assert_eq!(sig.edit_count, 1);
-        assert_eq!(sig.recent_write_count, 4);
+        assert_eq!(sig.recent_write_count, 2);
         assert_eq!(sig.recent_edit_count, 1);
     }
 

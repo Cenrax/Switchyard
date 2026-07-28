@@ -86,5 +86,15 @@ pub use error::{DriverError, LibsyError, Result};
 pub mod algorithms;
 
 mod observability;
-mod signal;
-pub use signal::{ToolSignals, DEFAULT_RECENT_WINDOW};
+pub use algorithms::util::tool_signals::{ToolSignals, DEFAULT_RECENT_WINDOW};
+
+/// Stage-router scoring and tier selection — the shared signal-driven routing
+/// core (scorer, picker, and the `StageClassifier`).
+// TODO cleanup once switchyard-components is removed
+pub mod stage_router {
+    pub use crate::algorithms::util::handoff_notes::{HandoffNoteProcessor, HANDOFF_NOTE_KEY};
+    pub use crate::algorithms::util::stage_router::{
+        dimensions_from_signal, pick_tier, score_signal, CodingAgentDimensions, DecisionSource,
+        PickOutcome, PickerMode, ScoreResult, StageClassifier, Tier,
+    };
+}
