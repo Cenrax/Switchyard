@@ -1,40 +1,44 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-//! Fall-through classifier routing: a stateful [`Algorithm`] that routes each turn
+//! Fall-through classifier routing: a composable [`Algorithm`] that routes each turn
 //! through a processor chain and a classifier cascade.
 //!
-//! Each turn: request-side [`Processor`]s fold facts into the session [`State`](crate::State); the
+//! Each turn: request-side [`Processor`]s fold facts into the composition's state; the
 //! [`Classifier`] cascade is consulted in order and the first to score decides the target
 //! (its `argmax`); the [`Decision`] is published and then replayed to the processors so
 //! stateful ones (latch, affinity) can bind it.
 //!
-//! [`FallThrough`] itself is stateless — one shared instance serves every session. The
-//! per-session [`State`](crate::State) rides in the threaded [`Context<SharedState>`] the caller passes into
-//! each turn, so routing can depend on accumulated history rather than the current request
-//! alone. The state is held under a lock, so concurrent turns of the same session serialize
-//! on it.
+//! The default `FallThrough<()>` has no state. Stateful compositions share one private state
+//! value across turns with the same session ID. Requests without a session ID use unretained
+//! per-run state.
 
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use parking_lot::Mutex;
+use tokio::sync::Mutex as AsyncMutex;
 
-use crate::core::{Classifier, Event, Processor, Score, SharedState};
+use crate::core::{Classifier, Event, Processor, Score};
 use crate::{
     Algorithm, Context, Decision, Driver, LibsyError, LlmTargetSet, Request, Response, Result,
     RoutedLlmClient,
 };
 
+type SessionStates<S> = Mutex<HashMap<String, Arc<AsyncMutex<S>>>>;
+
 /// The decision a fall-through run produces: the selected model plus a human-readable reason.
 pub struct FallThroughDecision {
-    model: String,
-    reason: String,
+    /// Target selected by the classifier cascade.
+    pub selected_model: String,
+    /// Human-readable explanation of the selection.
+    pub reasoning: String,
     tier: Option<&'static str>,
 }
 
 impl Decision for FallThroughDecision {
     fn selected_model(&self) -> &str {
-        &self.model
+        &self.selected_model
     }
 
     fn routing_tier(&self) -> Option<&str> {
@@ -42,7 +46,7 @@ impl Decision for FallThroughDecision {
     }
 
     fn reasoning(&self) -> Option<&str> {
-        Some(&self.reason)
+        Some(&self.reasoning)
     }
 
     fn as_any(&self) -> &dyn std::any::Any {
@@ -52,36 +56,69 @@ impl Decision for FallThroughDecision {
 
 /// Processor chain → classifier cascade → routed model call. See the [module docs](self).
 ///
-/// Stateless: the per-session [`State`](crate::State) lives in the threaded [`Context<SharedState>`], so one
-/// shared instance serves every session (see the module docs).
-pub struct FallThrough {
-    processors: Vec<Arc<dyn Processor>>,
-    classifiers: Vec<Arc<dyn Classifier>>,
+/// The generic state type is shared by every processor and classifier in the composition.
+pub struct FallThrough<S = ()> {
+    name: String,
+    decision_reason: fn(&str, &Score) -> String,
+    processors: Vec<Arc<dyn Processor<S>>>,
+    classifiers: Vec<Arc<dyn Classifier<S>>>,
     targets: LlmTargetSet,
+    session_states: Option<SessionStates<S>>,
 }
 
-impl FallThrough {
-    /// Creates an empty router over `targets`; add components with the `with_*` builders.
+impl FallThrough<()> {
+    /// Creates an empty stateless router.
     pub fn new(targets: LlmTargetSet) -> Self {
         Self {
+            name: "fall_through".to_string(),
+            decision_reason: default_decision_reason,
             processors: Vec::new(),
             classifiers: Vec::new(),
             targets,
+            session_states: None,
+        }
+    }
+}
+
+impl<S> FallThrough<S>
+where
+    S: Default + Send + 'static,
+{
+    /// Creates a router that retains one private `S` per session.
+    pub fn new_with_state(targets: LlmTargetSet) -> Self {
+        Self {
+            name: "fall_through".to_string(),
+            decision_reason: default_decision_reason,
+            processors: Vec::new(),
+            classifiers: Vec::new(),
+            targets,
+            session_states: Some(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Sets the stable, low-cardinality telemetry name for this composition.
+    pub fn with_name(mut self, name: impl Into<String>) -> Self {
+        self.name = name.into();
+        self
+    }
+
+    /// Sets the decision reasoning for an algorithm assembled from this cascade.
+    pub(crate) fn with_decision_reason(mut self, reason: fn(&str, &Score) -> String) -> Self {
+        self.decision_reason = reason;
+        self
+    }
+
     /// Appends a processor to the head-of-request chain.
-    pub fn with_processor(mut self, processor: Arc<dyn Processor>) -> Self {
+    pub fn with_processor(mut self, processor: Arc<dyn Processor<S>>) -> Self {
         self.processors.push(processor);
         self
     }
 
     /// Appends a classifier to the cascade.
-    pub fn with_classifier(mut self, classifier: Arc<dyn Classifier>) -> Self {
+    pub fn with_classifier(mut self, classifier: Arc<dyn Classifier<S>>) -> Self {
         self.classifiers.push(classifier);
         self
     }
-
     /// Registers one dual-role component in *both* the processor chain and the classifier
     /// cascade.
     ///
@@ -90,41 +127,67 @@ impl FallThrough {
     /// shares that state through the instance, so both roles must be the same `Arc`.
     /// Registering the two separately is easy to half-wire: omit the processor and the
     /// classifier silently never sees an assignment. This registers both at once.
-    pub fn with_component<T: Processor + Classifier + 'static>(self, component: Arc<T>) -> Self {
+    pub fn with_component<T>(self, component: Arc<T>) -> Self
+    where
+        T: Processor<S> + Classifier<S> + 'static,
+    {
         self.with_processor(component.clone())
             .with_classifier(component)
     }
-}
-#[async_trait]
-impl Algorithm<SharedState> for FallThrough {
-    fn name(&self) -> &str {
-        "fall_through"
-    }
 
-    fn count_tokens_client(&self) -> Option<Arc<dyn RoutedLlmClient>> {
-        self.targets.count_tokens_client()
-    }
-
-    async fn create_run_task(
-        self: Arc<Self>,
-        ctx: Context<SharedState>,
+    /// Executes the processor/classifier/target-call sequence for wrappers and the trait entrypoint.
+    pub(crate) async fn execute(
+        &self,
+        ctx: Context,
         driver: Driver,
         request: Request,
     ) -> Result<Response> {
-        // Hold the session state (carried in the threaded context) for the whole
-        // request→decision fold, so a turn's fact accumulation is atomic and concurrent
-        // turns of the same session serialize on it.
-        let mut state = ctx.state.lock().await;
-
         // The request is threaded mutably through the whole fold: any component may rewrite
-        // it, later components see the rewrite, and the final value is what reaches the model.
+        // it, later components see the rewrite, and the final value reaches the model.
         let mut request = request;
+        let session_state = self.session_state(&request);
+        let (target, decision) = match session_state {
+            Some(state) => {
+                let mut state = state.lock().await;
+                self.route(&mut state, &ctx, &driver, &mut request).await?
+            }
+            None => {
+                let mut state = S::default();
+                self.route(&mut state, &ctx, &driver, &mut request).await?
+            }
+        };
 
-        // 1. Processor chain accumulates request-side facts into the session State.
+        driver
+            .call_llm_target(ctx, &target, request, decision)
+            .await
+    }
+
+    /// Returns this request's retained state without holding the registry lock.
+    fn session_state(&self, request: &Request) -> Option<Arc<AsyncMutex<S>>> {
+        let states = self.session_states.as_ref()?;
+        let session_id = request
+            .metadata
+            .as_ref()?
+            .session_id
+            .as_deref()
+            .filter(|session_id| !session_id.is_empty())?;
+        let mut states = states.lock();
+        let state = states
+            .entry(session_id.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(S::default())));
+        Some(Arc::clone(state))
+    }
+
+    async fn route(
+        &self,
+        state: &mut S,
+        ctx: &Context,
+        driver: &Driver,
+        request: &mut Request,
+    ) -> Result<(crate::LlmTarget, Arc<dyn Decision>)> {
+        // 1. Processor chain accumulates request-side facts into the composition's state.
         for processor in &self.processors {
-            processor
-                .process(&mut state, Event::Request(&mut request))
-                .await?;
+            processor.process(state, Event::Request(request)).await?;
         }
 
         // 2. Fall through the cascade: the first classifier to score decides (argmax). The
@@ -132,9 +195,7 @@ impl Algorithm<SharedState> for FallThrough {
         let mut maybe_score: Option<Score> = None;
         let mut maybe_tier: Option<&'static str> = None;
         for classifier in &self.classifiers {
-            let scores = classifier
-                .score(&mut state, &mut request, Some(&driver))
-                .await?;
+            let scores = classifier.score(state, request, Some(driver)).await?;
             maybe_score = scores.argmax(false)?;
             if let Some(s) = maybe_score.as_ref() {
                 maybe_tier = classifier.routing_tier(&s.target);
@@ -150,33 +211,63 @@ impl Algorithm<SharedState> for FallThrough {
         // 3. Resolve the target and publish the decision.
         let target = self.targets.get_target(&score.target)?;
         let decision: Arc<dyn Decision> = Arc::new(FallThroughDecision {
-            model: score.target.clone(),
-            reason: format!(
-                "fall-through selected {} (confidence {:.3})",
-                score.target, score.confidence
-            ),
+            selected_model: score.target.clone(),
+            reasoning: (self.decision_reason)(&self.name, &score),
             tier: maybe_tier,
         });
-        driver.info(ctx.without_state(), decision.clone()).await?;
+        driver.info(ctx.clone(), decision.clone()).await?;
 
-        // 4. Replay the decision to the processors so stateful ones (latch / affinity) bind
-        //    it into the session State.
+        // 4. Replay the decision to the processors so stateful ones can bind it.
         for processor in &self.processors {
             processor
-                .process(&mut state, Event::Decision(decision.as_ref()))
+                .process(
+                    state,
+                    Event::Decision {
+                        request,
+                        decision: decision.as_ref(),
+                    },
+                )
                 .await?;
         }
 
-        driver
-            .call_llm_target(ctx.without_state(), &target, request, decision)
-            .await
+        Ok((target, decision))
+    }
+}
+
+fn default_decision_reason(_name: &str, winner: &Score) -> String {
+    format!(
+        "fall-through selected {} (confidence {:.3})",
+        winner.target, winner.confidence
+    )
+}
+
+#[async_trait]
+impl<S> Algorithm for FallThrough<S>
+where
+    S: Default + Send + 'static,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn count_tokens_client(&self) -> Option<Arc<dyn RoutedLlmClient>> {
+        self.targets.count_tokens_client()
+    }
+
+    async fn create_run_task(
+        self: Arc<Self>,
+        ctx: Context,
+        driver: Driver,
+        request: Request,
+    ) -> Result<Response> {
+        self.execute(ctx, driver, request).await
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::core::{Classification, State};
+    use crate::core::Classification;
 
     use switchyard_protocol::{
         completion_text, text_response, LlmRequest, Message, Metadata, Role,
@@ -258,7 +349,7 @@ mod tests {
     impl Classifier for FixedClassifier {
         async fn score(
             &self,
-            _state: &mut State,
+            _state: &mut (),
             _request: &mut Request,
             _driver: Option<&Driver>,
         ) -> Result<Classification> {
@@ -300,13 +391,15 @@ mod tests {
         }
     }
 
-    /// Drives a shared router through one turn on the given session context, returning the
-    /// completion text + trace. Reuse the same `ctx` across calls to model a session.
-    async fn run_turn(
-        router: &Arc<FallThrough>,
-        ctx: Context<SharedState>,
-    ) -> Result<(String, Vec<Arc<dyn Decision>>)> {
-        let (trace, response) = router.clone().run(ctx, request()).await?;
+    /// Drives a shared router with one request, returning the completion text + trace.
+    async fn run_request<S>(
+        router: &Arc<FallThrough<S>>,
+        request: Request,
+    ) -> Result<(String, Vec<Arc<dyn Decision>>)>
+    where
+        S: Default + Send + 'static,
+    {
+        let (trace, response) = router.clone().run(Context::default(), request).await?;
         let text = response
             .llm_response
             .into_agg()
@@ -316,16 +409,24 @@ mod tests {
         Ok((text, trace))
     }
 
-    /// Drives a fresh router through one turn on a fresh session.
+    /// Drives a shared router through one turn in the default test session.
+    async fn run_turn<S>(router: &Arc<FallThrough<S>>) -> Result<(String, Vec<Arc<dyn Decision>>)>
+    where
+        S: Default + Send + 'static,
+    {
+        run_request(router, request()).await
+    }
+
+    /// Drives a fresh router through one turn.
     async fn run(router: FallThrough) -> Result<(String, Vec<Arc<dyn Decision>>)> {
-        run_turn(&Arc::new(router), Context::default()).await
+        run_turn(&Arc::new(router)).await
     }
 
     // --- tests -------------------------------------------------------------------------
 
     #[tokio::test]
     async fn argmax_picks_the_highest_confidence_target() -> Result<()> {
-        let router = FallThrough::new(target_set(&["strong", "weak"]))
+        let router = FallThrough::<()>::new(target_set(&["strong", "weak"]))
             .with_classifier(fixed(vec![score("weak", 0.2), score("strong", 0.9)]));
         let (model, trace) = run(router).await?;
         assert_eq!(model, "strong");
@@ -337,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn falls_through_the_first_abstaining_classifier() -> Result<()> {
         // First classifier abstains (empty); the second decides.
-        let router = FallThrough::new(target_set(&["strong", "weak"]))
+        let router = FallThrough::<()>::new(target_set(&["strong", "weak"]))
             .with_classifier(fixed(vec![]))
             .with_classifier(fixed(vec![score("weak", 1.0)]));
         let (model, _) = run(router).await?;
@@ -348,7 +449,7 @@ mod tests {
     #[tokio::test]
     async fn first_deciding_classifier_wins_the_cascade() -> Result<()> {
         // The first classifier decides; the second is never consulted.
-        let router = FallThrough::new(target_set(&["strong", "weak"]))
+        let router = FallThrough::<()>::new(target_set(&["strong", "weak"]))
             .with_classifier(fixed(vec![score("strong", 0.6)]))
             .with_classifier(fixed(vec![score("weak", 1.0)]));
         let (model, _) = run(router).await?;
@@ -359,7 +460,7 @@ mod tests {
     #[tokio::test]
     async fn all_abstaining_is_an_error() -> Result<()> {
         let router =
-            FallThrough::new(target_set(&["strong", "weak"])).with_classifier(fixed(vec![]));
+            FallThrough::<()>::new(target_set(&["strong", "weak"])).with_classifier(fixed(vec![]));
         let error = run(router)
             .await
             .err()
@@ -381,7 +482,7 @@ mod tests {
         impl Classifier for NeedsDriver {
             async fn score(
                 &self,
-                _state: &mut State,
+                _state: &mut (),
                 _request: &mut Request,
                 driver: Option<&Driver>,
             ) -> Result<Classification> {
@@ -392,7 +493,7 @@ mod tests {
             }
         }
 
-        let router = FallThrough::new(target_set(&["strong", "weak"]))
+        let router = FallThrough::<()>::new(target_set(&["strong", "weak"]))
             .with_classifier(Arc::new(NeedsDriver));
         let (model, _) = run(router).await?;
         assert_eq!(model, "strong");
@@ -408,10 +509,10 @@ mod tests {
 
         #[async_trait]
         impl Processor for RecordingProcessor {
-            async fn process(&self, _state: &mut State, event: Event<'_>) -> Result<()> {
+            async fn process(&self, _state: &mut (), event: Event<'_>) -> Result<()> {
                 let kind = match event {
                     Event::Request(_) => "request",
-                    Event::Decision(_) => "decision",
+                    Event::Decision { .. } => "decision",
                     _ => "other",
                 };
                 self.0.lock().push(kind);
@@ -420,7 +521,7 @@ mod tests {
         }
 
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let router = FallThrough::new(target_set(&["strong", "weak"]))
+        let router = FallThrough::<()>::new(target_set(&["strong", "weak"]))
             .with_processor(Arc::new(RecordingProcessor(seen.clone())))
             .with_classifier(fixed(vec![score("strong", 1.0)]));
         run(router).await?;
@@ -438,7 +539,7 @@ mod tests {
 
         #[async_trait]
         impl Processor for Appender {
-            async fn process(&self, _state: &mut State, event: Event<'_>) -> Result<()> {
+            async fn process(&self, _state: &mut (), event: Event<'_>) -> Result<()> {
                 if let Event::Request(request) = event {
                     request
                         .llm_request
@@ -457,7 +558,7 @@ mod tests {
         impl Classifier for TrailClassifier {
             async fn score(
                 &self,
-                _state: &mut State,
+                _state: &mut (),
                 request: &mut Request,
                 _driver: Option<&Driver>,
             ) -> Result<Classification> {
@@ -486,7 +587,7 @@ mod tests {
             .with_processor(Arc::new(Appender("second")))
             .with_classifier(Arc::new(TrailClassifier(seen_by_classifier.clone())));
 
-        run_turn(&Arc::new(router), Context::default()).await?;
+        run_turn(&Arc::new(router)).await?;
 
         // The classifier saw both processors' edits, in chain order, on top of the original.
         assert_eq!(*seen_by_classifier.lock(), vec!["hi", "first", "second"]);
@@ -507,58 +608,72 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn state_persists_across_turns() -> Result<()> {
+    async fn state_is_shared_within_a_session_and_isolated_between_sessions() -> Result<()> {
+        #[derive(Default)]
+        struct TurnState {
+            count: u32,
+        }
+
         // Increments the session turn count on every request.
         struct CountingProcessor;
 
         #[async_trait]
-        impl Processor for CountingProcessor {
-            async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
+        impl Processor<TurnState> for CountingProcessor {
+            async fn process(&self, state: &mut TurnState, event: Event<'_>) -> Result<()> {
                 if let Event::Request(_) = event {
-                    state.turn_count += 1;
+                    state.count += 1;
                 }
                 Ok(())
             }
         }
 
-        // Routes to "weak" until the session has accumulated >= 2 turns, then "strong" —
-        // its decision depends only on state carried over from earlier turns.
+        // Routes weak on a session's first turn and strong on later turns.
         struct ThresholdClassifier;
 
         #[async_trait]
-        impl Classifier for ThresholdClassifier {
+        impl Classifier<TurnState> for ThresholdClassifier {
             async fn score(
                 &self,
-                state: &mut State,
+                state: &mut TurnState,
                 _request: &mut Request,
                 _driver: Option<&Driver>,
             ) -> Result<Classification> {
-                let target = if state.turn_count >= 2 {
-                    "strong"
-                } else {
-                    "weak"
-                };
+                let target = if state.count >= 2 { "strong" } else { "weak" };
                 Ok(Classification::Scores(vec![score(target, 1.0)]))
             }
         }
 
-        // One shared, stateless router; the session lives in the context we thread through.
         let router = Arc::new(
-            FallThrough::new(target_set(&["strong", "weak"]))
+            FallThrough::<TurnState>::new_with_state(target_set(&["strong", "weak"]))
                 .with_processor(Arc::new(CountingProcessor))
                 .with_classifier(Arc::new(ThresholdClassifier)),
         );
 
-        // One session context, reused across three turns. The turn counter accumulates in
-        // its `State`, so the classifier crosses its threshold on turn 2.
-        let ctx = Context::<SharedState>::default();
-        let (turn1, _) = run_turn(&router, ctx.clone()).await?;
-        let (turn2, _) = run_turn(&router, ctx.clone()).await?;
-        let (turn3, _) = run_turn(&router, ctx.clone()).await?;
+        let (turn1, _) = run_turn(&router).await?;
+        let (turn2, _) = run_turn(&router).await?;
+        let (second_session, _) = run_request(
+            &router,
+            Request {
+                metadata: Some(Metadata {
+                    session_id: Some("session-2".to_string()),
+                    ..Metadata::default()
+                }),
+                ..request()
+            },
+        )
+        .await?;
+        let anonymous = Request {
+            metadata: None,
+            ..request()
+        };
+        let (anonymous1, _) = run_request(&router, anonymous.clone()).await?;
+        let (anonymous2, _) = run_request(&router, anonymous).await?;
 
-        assert_eq!(turn1, "weak"); // count 1 — below threshold
-        assert_eq!(turn2, "strong"); // count 2 — state carried over from turn 1
-        assert_eq!(turn3, "strong"); // count 3 — still above threshold
+        assert_eq!(turn1, "weak");
+        assert_eq!(turn2, "strong");
+        assert_eq!(second_session, "weak");
+        assert_eq!(anonymous1, "weak");
+        assert_eq!(anonymous2, "weak");
         Ok(())
     }
 }

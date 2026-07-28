@@ -1,10 +1,9 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use std::collections::HashMap;
-use std::sync::Arc;
+//! Built-in state shared by processors and classifiers across a session.
 
-use tokio::sync::Mutex;
+use std::collections::HashMap;
 
 use crate::ToolSignals;
 
@@ -17,7 +16,7 @@ pub enum StateValue {
     Scalar(f32),
 }
 
-/// State maintained by [`Algorithm`](crate::Algorithm)s
+/// Routing facts accumulated across one session's algorithm runs.
 #[derive(Debug, Clone, Default)]
 pub struct State {
     pub turn_count: u32,
@@ -27,6 +26,3 @@ pub struct State {
     pub tool_signals: Option<ToolSignals>,
     pub extra: HashMap<String, StateValue>,
 }
-
-/// State shared accross tunrs / sessions
-pub type SharedState = Arc<Mutex<State>>;

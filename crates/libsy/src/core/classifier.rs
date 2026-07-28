@@ -1,7 +1,7 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Driver, LibsyError, Result, State};
+use crate::{Driver, LibsyError, Result};
 use async_trait::async_trait;
 use switchyard_protocol::Request;
 
@@ -67,9 +67,9 @@ fn argmax(scores: &[Score]) -> Result<Option<Score>> {
     Ok(best.cloned())
 }
 
-/// Scores each of the classifier's targets given State the current Request
+/// Scores targets from the current request and the composition's state.
 #[async_trait]
-pub trait Classifier: Send + Sync {
+pub trait Classifier<S = ()>: Send + Sync {
     /// Stable tier represented by `selected_model`, when this classifier defines one.
     fn routing_tier(&self, _selected_model: &str) -> Option<&'static str> {
         None
@@ -85,7 +85,7 @@ pub trait Classifier: Send + Sync {
     /// only read it.
     async fn score(
         &self,
-        state: &mut State,
+        state: &mut S,
         request: &mut Request,
         driver: Option<&Driver>,
     ) -> Result<Classification>;
@@ -94,7 +94,6 @@ pub trait Classifier: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StateValue;
     use switchyard_protocol::text_request;
 
     /// Terse `Score` builder for the assertions below.
@@ -178,15 +177,14 @@ mod tests {
     struct RecordingClassifier;
 
     #[async_trait]
-    impl Classifier for RecordingClassifier {
+    impl Classifier<bool> for RecordingClassifier {
         async fn score(
             &self,
-            state: &mut State,
+            state: &mut bool,
             request: &mut Request,
             _driver: Option<&Driver>,
         ) -> Result<Classification> {
-            // Stash a marker in `extra` to prove state is threaded mutably.
-            state.extra.insert("ran".to_string(), StateValue::Count(1));
+            *state = true;
             let target = request.requested_model().unwrap_or("auto").to_string();
             Ok(Classification::Scores(vec![Score {
                 target,
@@ -197,7 +195,7 @@ mod tests {
 
     #[tokio::test]
     async fn classifier_reads_request_and_mutates_state() -> Result<()> {
-        let mut state = State::default();
+        let mut state = false;
         let mut request = Request {
             llm_request: text_request(Some("strong".to_string()), "hi"),
             raw_request: None,
@@ -211,7 +209,7 @@ mod tests {
             classification.argmax(false)?.map(|s| s.target),
             Some("strong".to_string())
         );
-        assert!(matches!(state.extra.get("ran"), Some(StateValue::Count(1))));
+        assert!(state);
         Ok(())
     }
 
@@ -222,7 +220,7 @@ mod tests {
     impl Classifier for RewritingClassifier {
         async fn score(
             &self,
-            _state: &mut State,
+            _state: &mut (),
             request: &mut Request,
             _driver: Option<&Driver>,
         ) -> Result<Classification> {
@@ -236,7 +234,7 @@ mod tests {
 
     #[tokio::test]
     async fn classifier_rewrites_the_request_in_place() -> Result<()> {
-        let mut state = State::default();
+        let mut state = ();
         let mut request = Request {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,

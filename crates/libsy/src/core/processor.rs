@@ -1,11 +1,11 @@
 // SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 // SPDX-License-Identifier: Apache-2.0
 
-use crate::{Result, State};
+use crate::Result;
 use async_trait::async_trait;
 use switchyard_protocol::{AggLlmResponse, Decision, Request, Signals};
 
-/// An event observed by the algorithm. Events are consumed by [`Processor`] to mutate [`State`]
+/// An event observed by the algorithm. Events are consumed by [`Processor`] to mutate state.
 ///
 /// The two request-bearing variants borrow the request mutably, so a processor may rewrite
 /// it in place and pass the rewritten request down the chain (see [`Processor::process`]).
@@ -15,63 +15,61 @@ pub enum Event<'a> {
     Request(&'a mut Request),
     /// An out-of-band agentic-stack signal (tool results, budget updates, …).
     Signal(&'a Signals),
-    /// A routing decision the algorithm just made.
-    Decision(&'a dyn Decision),
+    /// A routing decision paired with the request that produced it.
+    Decision {
+        /// The request classified by the algorithm.
+        request: &'a Request,
+        /// The routing decision produced for `request`.
+        decision: &'a dyn Decision,
+    },
     /// A request about to be sent to a model.
     ModelRequest(&'a mut Request),
     /// A buffered response received back from a model.
     ModelResponse(&'a AggLlmResponse),
 }
 
-/// Collects events as the algorithm runs and mutates [`State`]
+/// Collects events as the algorithm runs and mutates the composition's state.
 #[async_trait]
-pub trait Processor: Send + Sync {
+pub trait Processor<S = ()>: Send + Sync {
     /// Process an event, accumulating facts into `state`.
     ///
     /// A request-bearing event ([`Event::Request`], [`Event::ModelRequest`]) may also be
     /// rewritten in place; the edit propagates to the rest of the chain and to the model
     /// call. Most processors only read it.
-    async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()>;
+    async fn process(&self, state: &mut S, event: Event<'_>) -> Result<()>;
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::StateValue;
+    use std::collections::HashMap;
     use switchyard_protocol::{text_request, text_response};
 
-    /// The `State::extra` key each event variant tallies under.
+    type TestState = HashMap<&'static str, u32>;
+
+    /// The key each event variant tallies under.
     fn event_key(event: &Event<'_>) -> &'static str {
         match event {
             Event::Request(_) => "requests",
             Event::Signal(_) => "signals",
-            Event::Decision(_) => "decisions",
+            Event::Decision { .. } => "decisions",
             Event::ModelRequest(_) => "model_requests",
             Event::ModelResponse(_) => "model_responses",
         }
     }
 
-    /// Reads a `StateValue::Count` from `extra`, treating a missing key as zero.
-    fn count(state: &State, key: &str) -> u32 {
-        match state.extra.get(key) {
-            Some(StateValue::Count(n)) => *n,
-            _ => 0,
-        }
+    /// Reads a count, treating a missing key as zero.
+    fn count(state: &TestState, key: &'static str) -> u32 {
+        state.get(key).copied().unwrap_or_default()
     }
 
-    /// Tallies each event variant under its own key in [`State::extra`].
+    /// Tallies each event variant under its own key.
     struct CountingProcessor;
 
     #[async_trait]
-    impl Processor for CountingProcessor {
-        async fn process(&self, state: &mut State, event: Event<'_>) -> Result<()> {
-            let entry = state
-                .extra
-                .entry(event_key(&event).to_string())
-                .or_insert(StateValue::Count(0));
-            if let StateValue::Count(n) = entry {
-                *n += 1;
-            }
+    impl Processor<TestState> for CountingProcessor {
+        async fn process(&self, state: &mut TestState, event: Event<'_>) -> Result<()> {
+            *state.entry(event_key(&event)).or_default() += 1;
             Ok(())
         }
     }
@@ -102,7 +100,7 @@ mod tests {
     #[tokio::test]
     async fn processor_tallies_each_event_variant_into_state() -> Result<()> {
         let processor = CountingProcessor;
-        let mut state = State::default();
+        let mut state = TestState::default();
         let mut req = request();
         let response = text_response(None, "ok");
         let decision = TestDecision;
@@ -119,7 +117,13 @@ mod tests {
             .process(&mut state, Event::ModelResponse(&response))
             .await?;
         processor
-            .process(&mut state, Event::Decision(&decision))
+            .process(
+                &mut state,
+                Event::Decision {
+                    request: &req,
+                    decision: &decision,
+                },
+            )
             .await?;
         processor
             .process(&mut state, Event::Signal(&signals))
@@ -136,7 +140,7 @@ mod tests {
     #[tokio::test]
     async fn process_accumulates_state_across_repeated_events() -> Result<()> {
         let processor = CountingProcessor;
-        let mut state = State::default();
+        let mut state = TestState::default();
         let mut req = request();
 
         for _ in 0..3 {
@@ -154,7 +158,7 @@ mod tests {
 
     #[async_trait]
     impl Processor for RewritingProcessor {
-        async fn process(&self, _state: &mut State, event: Event<'_>) -> Result<()> {
+        async fn process(&self, _state: &mut (), event: Event<'_>) -> Result<()> {
             if let Event::Request(request) | Event::ModelRequest(request) = event {
                 request.llm_request.model = Some("rewritten".to_string());
             }
@@ -164,7 +168,7 @@ mod tests {
 
     #[tokio::test]
     async fn processor_rewrites_the_request_in_place() -> Result<()> {
-        let mut state = State::default();
+        let mut state = ();
         let mut req = request();
         assert_eq!(req.requested_model(), Some("auto"));
 
