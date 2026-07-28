@@ -47,6 +47,11 @@ export API_KEY="..."
 cargo run -p switchyard-server -- --config routes.toml
 ```
 
+The server logs exactly one structured terminal event per LLM request: successful responses at
+`INFO`, 4xx responses at `WARN`, and 5xx responses at `ERROR`. Set
+`RUST_LOG=switchyard_server=debug,libsy=debug` to include routing decisions and nested failure
+details. A streaming failure is logged separately because it can occur after the response starts.
+
 Target and route table names are local references. A target's `id` is the exact model ID sent
 upstream, and a route's `id` is the model clients send to select that algorithm.
 

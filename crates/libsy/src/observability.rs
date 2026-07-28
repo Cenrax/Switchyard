@@ -231,11 +231,11 @@ pub(crate) fn record_llm_call(
 }
 
 /// Records one published routing decision: the decision counter plus a
-/// structured info log carrying the decision's reasoning.
+/// structured debug event carrying the decision's reasoning.
 pub(crate) fn record_decision(ctx: &Context, decision: &dyn Decision) {
     let algorithm = algorithm_label(ctx);
     let selected_model = decision.selected_model();
-    tracing::info!(
+    tracing::debug!(
         target: SCOPE,
         algorithm,
         selected_model,
