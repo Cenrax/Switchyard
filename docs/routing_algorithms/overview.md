@@ -56,14 +56,13 @@ The examples use model IDs from the
 [OpenRouter model catalog](https://openrouter.ai/api/v1/models). Select IDs
 available to your account before deploying; catalog availability can change.
 
-## Model and passthrough routes
+## Model routes
 
 - `type: model` registers one explicit model alias without model discovery.
-- `type: passthrough` queries the upstream model catalog and registers the
-  discovered models.
 
-Both create direct, single-target chains. Use a routing policy when requests
-must be split or classified across targets.
+This creates a direct, single-target chain. Use a routing policy when requests
+must be split or classified across targets. There is no catalog auto-discovery,
+so to expose several upstream models, add one `type: model` route per model id.
 
 ## Self-hosted targets
 
@@ -133,7 +132,7 @@ Claude Code lineage signals in either direction: `false` keeps the request on
 normal routing even when delegated-work headers are present, and `true` marks a
 request as a sub-agent even when no harness headers appear.
 
-The key applies to `model`, `passthrough`, `deterministic`, `escalation_router`,
+The key applies to `model`, `deterministic`, `escalation_router`,
 and `stage_router` routes. `random_routing` expands into its table entries on a
 separate path and does not consume it.
 
