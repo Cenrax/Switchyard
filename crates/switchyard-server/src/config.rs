@@ -8,8 +8,8 @@ use std::fs;
 use std::path::Path;
 use std::sync::Arc;
 
-use libsy::algorithms::{FallThrough, LlmTaskClassifier, Noop, Passthrough, Random};
-use libsy::{Algorithm, LlmTarget, LlmTargetSet, RoutedLlmClient, State};
+use libsy::algorithms::{LlmTaskClassifier, Noop, Passthrough, Random, TaskClassifierConfig};
+use libsy::{Algorithm, LlmTarget, LlmTargetSet, RoutedLlmClient};
 use serde::Deserialize;
 use switchyard_llm_client::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
 
@@ -180,7 +180,8 @@ enum RouteConfig {
         classifier_target: String,
         strong_target: String,
         weak_target: String,
-        threshold: f64,
+        #[serde(flatten)]
+        classifier_config: TaskClassifierConfig,
     },
 }
 
@@ -263,22 +264,19 @@ fn build_algorithm(
             classifier_target,
             strong_target,
             weak_target,
-            threshold,
+            classifier_config,
             ..
         } => {
             let classifier = resolve_target(route_name, classifier_target, targets)?;
             let strong = resolve_target(route_name, strong_target, targets)?;
             let weak = resolve_target(route_name, weak_target, targets)?;
-            // The judge is called through its own target, so it is not a routing destination.
-            let target_set = LlmTargetSet::new(vec![strong.clone(), weak.clone()]);
             // The weak model is the efficient tier; the strong model is the capable one.
-            let judge =
-                LlmTaskClassifier::new(classifier, weak, strong, *threshold).map_err(|error| {
-                    ServerError::new(format!("llm_classifier route {route_name}: {error}"))
-                })?;
-            let router =
-                FallThrough::<State>::new_with_state(target_set).with_classifier(Arc::new(judge));
-            Ok(Arc::new(router))
+            let algorithm =
+                LlmTaskClassifier::new(classifier, weak, strong, classifier_config.clone())
+                    .map_err(|error| {
+                        ServerError::new(format!("llm_classifier route {route_name}: {error}"))
+                    })?;
+            Ok(Arc::new(algorithm))
         }
     }
 }
@@ -362,7 +360,7 @@ type = "llm_classifier"
 classifier_target = "classifier"
 strong_target = "strong"
 weak_target = "weak"
-threshold = 0.5
+base_threshold = 0.5
 
 [routes.passthrough]
 id = "switchyard/passthrough"
@@ -439,8 +437,15 @@ target = "weak"
                 "at least one weight must be positive",
             ),
             (
-                VALID_CONFIG.replace("threshold = 0.5", "threshold = 1.5"),
-                "threshold must be between 0 and 1",
+                VALID_CONFIG.replace("base_threshold = 0.5", "base_threshold = 1.5"),
+                "base_threshold must be between 0 and 1",
+            ),
+            (
+                VALID_CONFIG.replace(
+                    "base_threshold = 0.5",
+                    "base_threshold = 0.5\nmessage_hash_fallback = true",
+                ),
+                "message_hash_fallback requires session_affinity",
             ),
             (
                 VALID_CONFIG.replace("schema_version = 1", "schema_version = 2"),
@@ -467,6 +472,16 @@ target = "weak"
             "targets = [\"strong\", \"weak\"]\nweights = [1, 3]\nseed = 42",
         );
         server_state_from_toml(&weighted)?;
+        Ok(())
+    }
+
+    #[test]
+    fn accepts_session_affinity_with_message_hash_fallback() -> ServerResult<()> {
+        let configured = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.25\nmin_confidence = 0.0\ncapability_elevated_floor = 0.45\nsession_affinity = true\nmessage_hash_fallback = true",
+        );
+        server_state_from_toml(&configured)?;
         Ok(())
     }
 

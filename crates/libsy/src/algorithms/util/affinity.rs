@@ -17,11 +17,12 @@
 //! session. [`AffinityRouter::for_subagents`] narrows affinity to explicitly identified
 //! child agents, leaving root traffic to later classifiers on every turn.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{hash_map::DefaultHasher, HashMap, HashSet};
+use std::hash::{Hash, Hasher};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
-use switchyard_protocol::Request;
+use switchyard_protocol::{Request, Role};
 
 use crate::{Classification, Classifier, Event, Processor, Score};
 
@@ -57,6 +58,8 @@ pub struct AffinityRouter {
     latch_only: Option<HashSet<String>>,
     /// Whether root-session requests should abstain instead of being retained.
     subagents_only: bool,
+    /// In absence of headers, use the message hash based fallback key to do task based routing
+    message_hash_fallback: bool,
     /// Retained assignments, shared across this router's processor and classifier roles.
     ///
     /// Held on the instance so the two roles share one process-local map through a
@@ -80,6 +83,12 @@ impl AffinityRouter {
         }
     }
 
+    /// Uses the first user-message text as a fallback key when metadata has no session.
+    pub fn with_message_hash_fallback(mut self) -> Self {
+        self.message_hash_fallback = true;
+        self
+    }
+
     /// Restricts latching to `models`; a decision for any other model routes but is not
     /// retained.
     pub fn with_latch_only(mut self, models: impl IntoIterator<Item = impl Into<String>>) -> Self {
@@ -96,18 +105,34 @@ impl AffinityRouter {
 
     /// Derives the stable identity this router should retain for `request`.
     fn affinity_key(&self, request: &Request) -> Option<AffinityKey> {
-        let metadata = request.metadata.as_ref()?;
-        let session = metadata.session_id.clone()?;
-        if metadata.is_subagent {
-            Some(AffinityKey::Subagent {
-                session,
-                agent: metadata.agent_id.clone()?,
-            })
-        } else if self.subagents_only {
-            None
-        } else {
-            Some(AffinityKey::Session(session))
+        if let Some(metadata) = request.metadata.as_ref() {
+            if let Some(session) = metadata.session_id.clone() {
+                return if metadata.is_subagent {
+                    metadata
+                        .agent_id
+                        .clone()
+                        .map(|agent| AffinityKey::Subagent { session, agent })
+                } else if self.subagents_only {
+                    None
+                } else {
+                    Some(AffinityKey::Session(session))
+                };
+            }
         }
+
+        // If headers are not present and we are not a subagent, use the message hash based fallback key to do task based routing
+        let is_subagent = request
+            .metadata
+            .as_ref()
+            .is_some_and(|metadata| metadata.is_subagent);
+        (!self.subagents_only && !is_subagent && self.message_hash_fallback)
+            .then(|| {
+                first_user_message_hash(request).map(|hash| {
+                    tracing::debug!(affinity_key = %hash, "affinity using message hash fallback");
+                    AffinityKey::Session(hash)
+                })
+            })
+            .flatten()
     }
 }
 
@@ -129,6 +154,20 @@ where
         }
         Ok(())
     }
+}
+
+/// Hashes the first user message so later turns retain the initial task's affinity.
+/// For benchmarking purpose with harnesses, task instructions are added as a user prompt to the request so we hash the initial user message.
+/// TODO: Have not considered multi-modal payloads yet. That needs to be handled separately.
+fn first_user_message_hash(request: &Request) -> Option<String> {
+    let message = request
+        .llm_request
+        .messages
+        .iter()
+        .find(|message| message.role == Role::User)?;
+    let mut hasher = DefaultHasher::new();
+    message.text_content("")?.hash(&mut hasher);
+    Some(format!("{:016x}", hasher.finish()))
 }
 
 #[async_trait]
@@ -171,7 +210,9 @@ mod tests {
 
     use std::sync::Arc;
 
-    use switchyard_protocol::{text_request, Decision, Metadata};
+    use switchyard_protocol::{
+        text_request, ContentBlock, Decision, LlmRequest, Message, Metadata,
+    };
 
     /// Boxed, thread-safe error type keeping the test helpers ergonomic.
     type BoxErr = Box<dyn std::error::Error + Send + Sync>;
@@ -198,6 +239,30 @@ mod tests {
             llm_request: text_request(Some("auto".to_string()), "hi"),
             raw_request: None,
             metadata: Some(metadata),
+        }
+    }
+
+    fn task_request(
+        metadata: Option<Metadata>,
+        first_user: &str,
+        follow_up: Option<&str>,
+    ) -> Request {
+        let mut messages = vec![
+            Message::text(Role::System, "follow repository instructions"),
+            Message::text(Role::User, first_user),
+        ];
+        if let Some(follow_up) = follow_up {
+            messages.push(Message::text(Role::Assistant, "I will inspect the code."));
+            messages.push(Message::text(Role::User, follow_up));
+        }
+        Request {
+            llm_request: LlmRequest {
+                model: Some("auto".to_string()),
+                messages,
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata,
         }
     }
 
@@ -371,6 +436,112 @@ mod tests {
         // No session id at all: nothing to key on.
         let mut req = request(Metadata::default());
         assert!(scores(&router, &mut state, &mut req).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_hash_fallback_uses_the_first_user_message() -> Result<(), BoxErr> {
+        let router = AffinityRouter::new().with_message_hash_fallback();
+        let mut state = ();
+
+        let mut first = task_request(
+            None,
+            "Add a unit test for this function.",
+            Some("Now run the test suite."),
+        );
+        retain(&router, &mut state, &mut first, "weak").await?;
+
+        let mut follow_up = task_request(
+            None,
+            "Add a unit test for this function.",
+            Some("Now file a pull request."),
+        );
+        assert_eq!(
+            scores(&router, &mut state, &mut follow_up)
+                .await?
+                .first()
+                .map(|score| score.target.as_str()),
+            Some("weak")
+        );
+
+        let mut other_task = task_request(
+            None,
+            "Reimplement this binary from two input/output pairs.",
+            Some("Now run the test suite."),
+        );
+        assert!(scores(&router, &mut state, &mut other_task)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn user_message_hash_ignores_non_text_provider_payloads() {
+        let request = |user_message| Request {
+            llm_request: LlmRequest {
+                messages: vec![user_message],
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata: None,
+        };
+        let text_only = request(Message::text(Role::User, "Implement the parser."));
+        let text_with_reasoning = request(Message {
+            role: Role::User,
+            content: vec![
+                ContentBlock::Text {
+                    text: "Implement the parser.".to_string(),
+                },
+                ContentBlock::Reasoning {
+                    text: "Internal provider reasoning.".to_string(),
+                    signature: Some("provider-signature".to_string()),
+                },
+            ],
+        });
+
+        assert_eq!(
+            first_user_message_hash(&text_only),
+            first_user_message_hash(&text_with_reasoning)
+        );
+    }
+
+    #[tokio::test]
+    async fn metadata_session_takes_precedence_over_message_hash() -> Result<(), BoxErr> {
+        let router = AffinityRouter::new().with_message_hash_fallback();
+        let mut state = ();
+
+        let mut first = task_request(
+            Some(session("session-1", "agent-a")),
+            "Implement the parser.",
+            None,
+        );
+        retain(&router, &mut state, &mut first, "strong").await?;
+
+        let mut other_session = task_request(
+            Some(session("session-2", "agent-a")),
+            "Implement the parser.",
+            None,
+        );
+        assert!(scores(&router, &mut state, &mut other_session)
+            .await?
+            .is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn message_hash_fallback_abstains_for_subagents() -> Result<(), BoxErr> {
+        let router = AffinityRouter::new().with_message_hash_fallback();
+        let mut state = ();
+        let mut subagent = task_request(
+            Some(Metadata {
+                is_subagent: true,
+                ..Metadata::default()
+            }),
+            "Implement the parser.",
+            None,
+        );
+
+        assert!(scores(&router, &mut state, &mut subagent).await?.is_empty());
         Ok(())
     }
 
