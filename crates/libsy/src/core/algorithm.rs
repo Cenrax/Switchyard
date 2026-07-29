@@ -327,6 +327,20 @@ impl LlmTargetSet {
             })
     }
 
+    /// The named target, or the first one this request is not barred from when it has been
+    /// excluded (see [`Context::exclude_target`]). Errors if every target is excluded.
+    pub fn resolve_target(&self, name: &str, ctx: &Context) -> Result<LlmTarget> {
+        let target = self.get_target(name)?;
+        if !ctx.is_excluded(&target.semantic_name) {
+            return Ok(target);
+        }
+        self.targets
+            .iter()
+            .find(|t| !ctx.is_excluded(&t.semantic_name))
+            .cloned()
+            .ok_or(LibsyError::AllTargetsExcluded)
+    }
+
     /// The first target's client that can serve `count_tokens` (an Anthropic
     /// upstream), or `None` when no target has one. Used by an algorithm's
     /// [`count_tokens_client`](crate::Algorithm::count_tokens_client).
@@ -464,6 +478,7 @@ pub trait Algorithm: Send + Sync + 'static {
 
     /// Process a request to completion, returning the final [`Response`] and the trace of
     /// [`Decision`]s the algorithm made along the way.
+    ///
     async fn run(
         self: Arc<Self>,
         ctx: Context,

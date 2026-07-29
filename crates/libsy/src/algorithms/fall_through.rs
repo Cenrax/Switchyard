@@ -21,8 +21,8 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use crate::core::{Classifier, Event, Processor, Score};
 use crate::{
-    Algorithm, Context, Decision, Driver, LibsyError, LlmTargetSet, Request, Response, Result,
-    RoutedLlmClient,
+    Algorithm, Context, Decision, Driver, LibsyError, LlmClientError, LlmTarget, LlmTargetSet,
+    Request, Response, Result, RoutedLlmClient,
 };
 
 type SessionStates<S> = Mutex<HashMap<String, Arc<AsyncMutex<S>>>>;
@@ -157,9 +157,62 @@ where
             }
         };
 
-        driver
-            .call_llm_target(ctx, &target, request, decision)
+        self.call_with_overflow_fallback(ctx, &driver, target, decision, request)
             .await
+    }
+
+    /// Calls `target`, falling back to the next eligible target whenever one overflows its
+    /// context window, until a call succeeds or every target has been tried.
+    ///
+    /// Routing is deliberately not re-run: the fallback replaces the target in place so the
+    /// processor chain and the retained session state still see exactly one turn.
+    async fn call_with_overflow_fallback(
+        &self,
+        mut ctx: Context,
+        driver: &Driver,
+        mut target: LlmTarget,
+        mut decision: Arc<dyn Decision>,
+        request: Request,
+    ) -> Result<Response> {
+        loop {
+            let result = driver
+                .call_llm_target(ctx.clone(), &target, request.clone(), decision.clone())
+                .await;
+            let Err(error) = result else { return result };
+            let LibsyError::ClientCall {
+                target: failed,
+                source: LlmClientError::ContextWindowExceeded { .. },
+            } = &error
+            else {
+                return Err(error);
+            };
+            // A target already excluded means the pool is spent; surface the client error
+            // so the caller still sees a context overflow rather than an internal failure.
+            if !ctx.exclude_target(failed) {
+                return Err(error);
+            }
+            let Ok(next) = self.targets.resolve_target(&target.semantic_name, &ctx) else {
+                return Err(error);
+            };
+            decision = self.fallback_decision(&target, &next);
+            target = next;
+            driver.info(ctx.clone(), decision.clone()).await?;
+        }
+    }
+
+    /// The decision published when an overflow sends the request to a different target.
+    fn fallback_decision(&self, from: &LlmTarget, to: &LlmTarget) -> Arc<dyn Decision> {
+        Arc::new(FallThroughDecision {
+            selected_model: to.semantic_name.clone(),
+            reasoning: format!(
+                "{} exceeded its context window; fell back to {}",
+                from.semantic_name, to.semantic_name
+            ),
+            tier: self
+                .classifiers
+                .iter()
+                .find_map(|c| c.routing_tier(&to.semantic_name)),
+        })
     }
 
     /// Returns this request's retained state without holding the registry lock.
@@ -193,12 +246,12 @@ where
         // 2. Fall through the cascade: the first classifier to score decides (argmax). The
         //    per-request driver is offered to each — driver-backed classifiers use it.
         let mut maybe_score: Option<Score> = None;
-        let mut maybe_tier: Option<&'static str> = None;
+        let mut deciding: Option<&Arc<dyn Classifier<S>>> = None;
         for classifier in &self.classifiers {
             let scores = classifier.score(state, request, Some(driver)).await?;
             maybe_score = scores.argmax(false)?;
-            if let Some(s) = maybe_score.as_ref() {
-                maybe_tier = classifier.routing_tier(&s.target);
+            if maybe_score.is_some() {
+                deciding = Some(classifier);
                 break;
             }
         }
@@ -208,12 +261,21 @@ where
             });
         };
 
-        // 3. Resolve the target and publish the decision.
-        let target = self.targets.get_target(&score.target)?;
+        // 3. Resolve the target and publish the decision. When an excluded target sends
+        //    the request elsewhere, the tier and reasoning describe where it actually went.
+        let target = self.targets.resolve_target(&score.target, ctx)?;
+        let reasoning = if target.semantic_name == score.target {
+            (self.decision_reason)(&self.name, &score)
+        } else {
+            format!(
+                "{} exceeded its context window; fell back to {}",
+                score.target, target.semantic_name
+            )
+        };
         let decision: Arc<dyn Decision> = Arc::new(FallThroughDecision {
-            selected_model: score.target.clone(),
-            reasoning: (self.decision_reason)(&self.name, &score),
-            tier: maybe_tier,
+            selected_model: target.semantic_name.clone(),
+            reasoning,
+            tier: deciding.and_then(|c| c.routing_tier(&target.semantic_name)),
         });
         driver.info(ctx.clone(), decision.clone()).await?;
 
@@ -422,6 +484,144 @@ mod tests {
     }
 
     // --- tests -------------------------------------------------------------------------
+
+    /// Overflows for the named targets and echoes for the rest.
+    struct OverflowClient {
+        overflowing: Vec<&'static str>,
+    }
+
+    #[async_trait]
+    impl RoutedLlmClient for OverflowClient {
+        async fn call(
+            &self,
+            _ctx: Context,
+            _request: Request,
+            decision: Arc<dyn Decision>,
+        ) -> std::result::Result<Response, LlmClientError> {
+            let model = decision.selected_model().to_string();
+            if self.overflowing.contains(&model.as_str()) {
+                return Err(LlmClientError::ContextWindowExceeded {
+                    model,
+                    message: "prompt is too long".to_string(),
+                });
+            }
+            Ok(Response {
+                llm_response: LlmResponse::Agg(text_response(None, model)),
+                metadata: None,
+            })
+        }
+    }
+
+    /// `target_set`, but the named `overflowing` targets reject every call with a
+    /// context-window error so the retry path can be driven.
+    fn target_set_with_overflow(names: &[&str], overflowing: &[&'static str]) -> LlmTargetSet {
+        LlmTargetSet::new(
+            names
+                .iter()
+                .map(|name| LlmTarget {
+                    semantic_name: name.to_string(),
+                    llm_client: Some(Arc::new(OverflowClient {
+                        overflowing: overflowing.to_vec(),
+                    }) as Arc<dyn RoutedLlmClient>),
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn an_overflowing_target_is_retried_on_one_that_fits() -> Result<()> {
+        let router =
+            FallThrough::<()>::new(target_set_with_overflow(&["weak", "strong"], &["weak"]))
+                .with_classifier(fixed(vec![score("weak", 0.9)]));
+        let (model, _) = run(router).await?;
+        assert_eq!(model, "strong");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn overflowing_targets_are_retried_until_one_fits() -> Result<()> {
+        let router = FallThrough::<()>::new(target_set_with_overflow(
+            &["weak", "mid", "strong"],
+            &["weak", "mid"],
+        ))
+        .with_classifier(fixed(vec![score("weak", 0.9)]));
+        let (model, _) = run(router).await?;
+        assert_eq!(model, "strong");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn exhausting_every_target_surfaces_the_client_overflow() -> Result<()> {
+        // Only the client error maps to a 400 upstream, so it must survive exhaustion.
+        let router = FallThrough::<()>::new(target_set_with_overflow(
+            &["weak", "strong"],
+            &["weak", "strong"],
+        ))
+        .with_classifier(fixed(vec![score("weak", 0.9)]));
+        match run(router).await {
+            Ok(_) => panic!("expected an overflow error, got a response"),
+            Err(LibsyError::ClientCall {
+                source: LlmClientError::ContextWindowExceeded { .. },
+                ..
+            }) => Ok(()),
+            Err(other) => panic!("expected ContextWindowExceeded, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retried_request_runs_the_processors_once() -> Result<()> {
+        // Routing runs before the call loop, so an overflow must not replay processors.
+        struct CountingProcessor(Arc<Mutex<Vec<&'static str>>>);
+
+        #[async_trait]
+        impl Processor for CountingProcessor {
+            async fn process(&self, _state: &mut (), event: Event<'_>) -> Result<()> {
+                let kind = match event {
+                    Event::Request(_) => "request",
+                    Event::Decision { .. } => "decision",
+                    _ => "other",
+                };
+                self.0.lock().push(kind);
+                Ok(())
+            }
+        }
+
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let router =
+            FallThrough::<()>::new(target_set_with_overflow(&["weak", "strong"], &["weak"]))
+                .with_classifier(fixed(vec![score("weak", 0.9)]))
+                .with_processor(Arc::new(CountingProcessor(seen.clone())));
+        let (model, _) = run(router).await?;
+        assert_eq!(model, "strong");
+        assert_eq!(seen.lock().iter().filter(|e| **e == "request").count(), 1);
+        assert_eq!(seen.lock().iter().filter(|e| **e == "decision").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn an_excluded_target_reports_the_target_it_fell_back_to() -> Result<()> {
+        // Headers and usage metrics read the decision, so it must describe the real call.
+        let router = Arc::new(
+            FallThrough::<()>::new(target_set(&["weak", "strong"]))
+                .with_classifier(fixed(vec![score("weak", 0.9)])),
+        );
+        let mut ctx = Context::default();
+        ctx.exclude_target("weak");
+        let (trace, response) = router.run(ctx, request()).await?;
+        let text = response
+            .llm_response
+            .into_agg()
+            .await
+            .map(|agg| completion_text(&agg))
+            .map_err(|error| LibsyError::external("aggregating fall-through response", error))?;
+
+        assert_eq!(text, "strong");
+        assert_eq!(trace[0].selected_model(), "strong");
+        assert!(trace[0]
+            .reasoning()
+            .is_some_and(|r| r.contains("fell back to strong")));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn argmax_picks_the_highest_confidence_target() -> Result<()> {
