@@ -9,11 +9,17 @@
 //! (its `argmax`); the [`Decision`] is published and then replayed to the processors so
 //! stateful ones (latch, affinity) can bind it.
 //!
-//! The default `FallThrough<()>` has no state. Stateful compositions share one private state
-//! value across turns with the same session ID. Requests without a session ID use unretained
-//! per-run state.
+//! The default `FallThrough<()>` carries no composition state. Stateful compositions share one
+//! private state value across turns with the same session ID. Requests without a session ID use
+//! unretained per-run state.
+//!
+//! Every composition retains one thing regardless: a target that overflows its context window is
+//! remembered for the rest of its session and skipped on later turns.
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use async_trait::async_trait;
 use parking_lot::Mutex;
@@ -26,6 +32,10 @@ use crate::{
 };
 
 type SessionStates<S> = Mutex<HashMap<String, Arc<AsyncMutex<S>>>>;
+
+/// Matches the cap the Python stack uses. Dropping a live session's entry costs one
+/// rediscovered overflow, so the victim choice does not need to be exact.
+const MAX_EVICTION_SESSIONS: usize = 1_024;
 
 /// The decision a fall-through run produces: the selected model plus a human-readable reason.
 pub struct FallThroughDecision {
@@ -99,6 +109,7 @@ pub struct FallThrough<S = ()> {
     classifiers: Vec<Arc<dyn Classifier<S>>>,
     targets: LlmTargetSet,
     session_states: Option<SessionStates<S>>,
+    session_evictions: Mutex<HashMap<String, HashSet<String>>>,
 }
 
 impl FallThrough<()> {
@@ -111,6 +122,7 @@ impl FallThrough<()> {
             classifiers: Vec::new(),
             targets,
             session_states: None,
+            session_evictions: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -128,6 +140,7 @@ where
             classifiers: Vec::new(),
             targets,
             session_states: Some(Mutex::new(HashMap::new())),
+            session_evictions: Mutex::new(HashMap::new()),
         }
     }
 
@@ -180,6 +193,16 @@ where
         // The request is threaded mutably through the whole fold: any component may rewrite
         // it, later components see the rewrite, and the final value reaches the model.
         let mut request = request;
+        let session = session_id(&request);
+        let mut ctx = ctx;
+        for target in self.evicted_in_session(session.as_deref()) {
+            // Never seed the pool empty: a later turn may be small enough to serve, and the
+            // caller should get the upstream's answer rather than a routing error.
+            if self.eligible_targets(&ctx) <= 1 {
+                break;
+            }
+            ctx.exclude_target(target);
+        }
         let session_state = self.session_state(&request);
         let (target, decision) = match session_state {
             Some(state) => {
@@ -192,8 +215,48 @@ where
             }
         };
 
-        self.call_with_overflow_fallback(ctx, &driver, target, decision, request)
-            .await
+        self.call_with_overflow_fallback(
+            ctx,
+            &driver,
+            target,
+            decision,
+            request,
+            session.as_deref(),
+        )
+        .await
+    }
+
+    fn eligible_targets(&self, ctx: &Context) -> usize {
+        self.targets
+            .targets()
+            .iter()
+            .filter(|t| !ctx.is_excluded(&t.semantic_name))
+            .count()
+    }
+
+    fn evicted_in_session(&self, session: Option<&str>) -> Vec<String> {
+        let Some(session) = session else {
+            return Vec::new();
+        };
+        self.session_evictions
+            .lock()
+            .get(session)
+            .map(|targets| targets.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn record_eviction(&self, session: Option<&str>, target: &str) {
+        let Some(session) = session else { return };
+        let mut sessions = self.session_evictions.lock();
+        if sessions.len() >= MAX_EVICTION_SESSIONS && !sessions.contains_key(session) {
+            if let Some(oldest) = sessions.keys().next().cloned() {
+                sessions.remove(&oldest);
+            }
+        }
+        sessions
+            .entry(session.to_string())
+            .or_default()
+            .insert(target.to_string());
     }
 
     /// Calls `target`, falling back to the next eligible target whenever one overflows its
@@ -208,6 +271,7 @@ where
         mut target: LlmTarget,
         mut decision: Arc<dyn Decision>,
         request: Request,
+        session: Option<&str>,
     ) -> Result<Response> {
         loop {
             let result = driver
@@ -226,6 +290,7 @@ where
             if !ctx.exclude_target(failed) {
                 return Err(error);
             }
+            self.record_eviction(session, failed);
             let Ok(next) = self.targets.resolve_target(&target.semantic_name, &ctx) else {
                 return Err(error);
             };
@@ -253,15 +318,10 @@ where
     /// Returns this request's retained state without holding the registry lock.
     fn session_state(&self, request: &Request) -> Option<Arc<AsyncMutex<S>>> {
         let states = self.session_states.as_ref()?;
-        let session_id = request
-            .metadata
-            .as_ref()?
-            .session_id
-            .as_deref()
-            .filter(|session_id| !session_id.is_empty())?;
+        let session_id = session_id(request)?;
         let mut states = states.lock();
         let state = states
-            .entry(session_id.to_string())
+            .entry(session_id)
             .or_insert_with(|| Arc::new(AsyncMutex::new(S::default())));
         Some(Arc::clone(state))
     }
@@ -326,6 +386,16 @@ where
 
         Ok((target, decision))
     }
+}
+
+fn session_id(request: &Request) -> Option<String> {
+    request
+        .metadata
+        .as_ref()?
+        .session_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
 }
 
 fn default_decision_reason(_name: &str, winner: &Score) -> String {
@@ -517,9 +587,10 @@ mod tests {
 
     // --- tests -------------------------------------------------------------------------
 
-    /// Overflows for the named targets and echoes for the rest.
+    /// Overflows for the named targets and echoes for the rest, recording every call.
     struct OverflowClient {
         overflowing: Vec<&'static str>,
+        calls: Option<Arc<Mutex<Vec<String>>>>,
     }
 
     #[async_trait]
@@ -531,6 +602,9 @@ mod tests {
             decision: Arc<dyn Decision>,
         ) -> std::result::Result<Response, LlmClientError> {
             let model = decision.selected_model().to_string();
+            if let Some(calls) = &self.calls {
+                calls.lock().push(model.clone());
+            }
             if self.overflowing.contains(&model.as_str()) {
                 return Err(LlmClientError::ContextWindowExceeded {
                     model,
@@ -554,10 +628,92 @@ mod tests {
                     semantic_name: name.to_string(),
                     llm_client: Some(Arc::new(OverflowClient {
                         overflowing: overflowing.to_vec(),
+                        calls: None,
                     }) as Arc<dyn RoutedLlmClient>),
                 })
                 .collect(),
         )
+    }
+
+    fn counting_overflow_targets(
+        names: &[&str],
+        overflowing: &[&'static str],
+        calls: Arc<Mutex<Vec<String>>>,
+    ) -> LlmTargetSet {
+        LlmTargetSet::new(
+            names
+                .iter()
+                .map(|name| LlmTarget {
+                    semantic_name: name.to_string(),
+                    llm_client: Some(Arc::new(OverflowClient {
+                        overflowing: overflowing.to_vec(),
+                        calls: Some(calls.clone()),
+                    }) as Arc<dyn RoutedLlmClient>),
+                })
+                .collect(),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_target_that_overflowed_is_skipped_for_the_rest_of_the_session() -> Result<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(
+            FallThrough::<()>::new(counting_overflow_targets(
+                &["weak", "strong"],
+                &["weak"],
+                calls.clone(),
+            ))
+            .with_classifier(fixed(vec![score("weak", 0.9)])),
+        );
+        for _ in 0..3 {
+            assert_eq!(run_turn(&router).await?.0, "strong");
+        }
+        assert_eq!(calls.lock().iter().filter(|m| *m == "weak").count(), 1);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_different_session_starts_with_an_empty_eviction_set() -> Result<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(
+            FallThrough::<()>::new(counting_overflow_targets(
+                &["weak", "strong"],
+                &["weak"],
+                calls.clone(),
+            ))
+            .with_classifier(fixed(vec![score("weak", 0.9)])),
+        );
+        run_turn(&router).await?;
+        let mut other = request();
+        other.metadata = Some(Metadata {
+            session_id: Some("session-2".to_string()),
+            ..Metadata::default()
+        });
+        run_request(&router, other).await?;
+        assert_eq!(calls.lock().iter().filter(|m| *m == "weak").count(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn second_turn_after_full_exhaustion_still_reaches_upstream() -> Result<()> {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let router = Arc::new(
+            FallThrough::<()>::new(counting_overflow_targets(
+                &["weak", "strong"],
+                &["weak", "strong"],
+                calls.clone(),
+            ))
+            .with_classifier(fixed(vec![score("weak", 0.9)])),
+        );
+        let first = run_turn(&router).await;
+        assert!(first.is_err());
+        calls.lock().clear();
+        match run_turn(&router).await {
+            Err(LibsyError::ClientCall { .. }) => {}
+            Err(other) => panic!("turn 2 gave {other:?}, calls={:?}", calls.lock()),
+            Ok(_) => panic!("expected an error"),
+        }
+        Ok(())
     }
 
     #[tokio::test]
