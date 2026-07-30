@@ -19,7 +19,7 @@ use async_trait::async_trait;
 use parking_lot::Mutex;
 use tokio::sync::Mutex as AsyncMutex;
 
-use crate::core::{Classifier, Event, Processor, Score};
+use crate::core::{Classification, Classifier, Event, Processor, Score};
 use crate::{
     Algorithm, Context, Decision, Driver, LibsyError, LlmClientError, LlmTarget, LlmTargetSet,
     Request, Response, Result, RoutedLlmClient,
@@ -54,7 +54,42 @@ impl Decision for FallThroughDecision {
     }
 }
 
-/// Processor chain → classifier cascade → routed model call. See the [module docs](self).
+/// Terminal classifier for a cascade whose classifiers may all abstain.
+///
+/// A classifier abstains when it cannot decide, which lets the next one try. The
+/// last has no next, so a cascade that could abstain all the way through needs a
+/// decider that never does. Which target that is belongs to whoever assembles the
+/// cascade, not to the classifiers in it.
+pub struct DefaultTarget {
+    target: String,
+}
+
+impl DefaultTarget {
+    /// Close a cascade with `target`.
+    pub fn new(target: impl Into<String>) -> Self {
+        Self {
+            target: target.into(),
+        }
+    }
+}
+
+#[async_trait]
+impl<S: Send> Classifier<S> for DefaultTarget {
+    async fn score(
+        &self,
+        _state: &mut S,
+        _request: &mut Request,
+        _driver: Option<&Driver>,
+    ) -> Result<Classification> {
+        // Zero confidence: this is a fallback, not a judgement.
+        Ok(Classification::Scores(vec![Score {
+            target: self.target.clone(),
+            confidence: 0.0,
+        }]))
+    }
+}
+
+/// Processor chain → classifier cascade → routed model call. See the module docs.
 ///
 /// The generic state type is shared by every processor and classifier in the composition.
 pub struct FallThrough<S = ()> {
@@ -279,17 +314,14 @@ where
         });
         driver.info(ctx.clone(), decision.clone()).await?;
 
-        // 4. Replay the decision to the processors so stateful ones can bind it.
+        // 4. Post-decision replay: every processor sees the decision so stateful ones
+        //    can bind it, and may rewrite the outbound request (e.g. add a tier prompt).
         for processor in &self.processors {
-            processor
-                .process(
-                    state,
-                    Event::Decision {
-                        request,
-                        decision: decision.as_ref(),
-                    },
-                )
-                .await?;
+            let event = Event::Decision {
+                request,
+                decision: decision.as_ref(),
+            };
+            processor.process(state, event).await?;
         }
 
         Ok((target, decision))
@@ -700,10 +732,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn processor_observes_request_and_decision() -> Result<()> {
+    async fn processor_observes_request_then_decision() -> Result<()> {
         use parking_lot::Mutex;
 
-        // Records which event kinds it saw, proving the request-then-decision replay.
+        // Records which event kinds it saw, proving the replay order: the inbound
+        // request, then the routing decision (which carries the request to the model).
         struct RecordingProcessor(Arc<Mutex<Vec<&'static str>>>);
 
         #[async_trait]
