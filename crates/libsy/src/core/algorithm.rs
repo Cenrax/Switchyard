@@ -33,6 +33,33 @@ use crate::{observability, DriverError, LibsyError, Result};
 /// `Arc<dyn Algorithm>` object-safe.
 pub type StepStream = Pin<Box<dyn Stream<Item = Result<Step>> + Send>>;
 
+/// One completed model call observed at the algorithm offload boundary.
+#[derive(Clone, Debug)]
+pub struct LlmCallObservation {
+    pub selected_model: String,
+    /// Routing tier attached to the selected model, when present.
+    pub tier: Option<String>,
+    /// Whether this was the routed backend call rather than classifier or judge overhead.
+    pub is_routed: bool,
+    pub is_success: bool,
+    /// Time spent waiting for the model call to resolve.
+    pub duration: Duration,
+    /// Normalized usage for a buffered successful response.
+    pub usage: Option<Usage>,
+}
+
+/// One request-scoped observation emitted by the algorithm runner.
+#[derive(Clone, Debug)]
+pub enum RunObservation {
+    /// A completed model call.
+    LlmCall(LlmCallObservation),
+    /// Routing time recorded by the `switchyard.routing_overhead_ms` metric.
+    RoutingOverhead(Duration),
+}
+
+/// Request-scoped callback for algorithm-run observations.
+pub type RunObserver = Arc<dyn Fn(RunObservation) + Send + Sync>;
+
 /// A request paired with the routing [`Decision`] that produced it — the offload
 /// payload a host reads (via [`CallLlmRequest::get_routed`]) to serve the call.
 ///
@@ -118,21 +145,35 @@ pub struct Driver {
     driver: TypeErasedDriver,
     // How long the call that served this run took. We need this to calculate routing overhead.
     routed_call: Arc<Mutex<Option<Duration>>>,
+    observer: Option<RunObserver>,
 }
 
 impl Driver {
     /// Build an empty driver with its step channel ready. Created per call by
     /// [`run_stream`](Algorithm::run_stream).
     pub(crate) fn new() -> Self {
+        Self::with_observer(None)
+    }
+
+    fn with_observer(observer: Option<RunObserver>) -> Self {
         Self {
             driver: TypeErasedDriver::new(),
             routed_call: Arc::new(Mutex::new(None)),
+            observer,
         }
     }
 
     /// How long the call that served this run took, if one has succeeded.
     pub(crate) fn routed_call_duration(&self) -> Option<Duration> {
         *self.routed_call.lock()
+    }
+
+    /// Records routing overhead (how long Switchyard added to the call) once
+    /// per successful run. Called by `observe_run`.
+    pub(crate) fn observe_routing_overhead(&self, duration: Duration) {
+        if let Some(observer) = &self.observer {
+            observer(RunObservation::RoutingOverhead(duration));
+        }
     }
 
     /// Offload a model call: publish `routed` as a [`Step::CallLlm`] and await the
@@ -178,6 +219,20 @@ impl Driver {
             &result,
             &tracing::Span::current(),
         );
+        if let Some(observer) = &self.observer {
+            observer(RunObservation::LlmCall(LlmCallObservation {
+                selected_model,
+                tier,
+                is_routed,
+                is_success: result.is_ok(),
+                duration: elapsed,
+                usage: result
+                    .as_ref()
+                    .ok()
+                    .and_then(|response| response.llm_response.as_agg())
+                    .map(|response| response.usage.clone()),
+            }));
+        }
         // Classifier and judge calls are routing overhead.
         // And don't record time for failed calls.
         if is_routed && result.is_ok() {
@@ -424,7 +479,13 @@ pub trait Algorithm: Send + Sync + 'static {
     /// Process a request to completion, returning a stream of [`Step`]s.
     /// Each [`Step::CallLlm`] is an offloaded model call the consumer must serve.
     /// The stream ends with a [`Step::ReturnToAgent`] on success, or an `Err` item on failure.
-    fn run_stream(self: Arc<Self>, ctx: Context, request: Request) -> StepStream {
+    /// Report each model call to `observer`.
+    fn run_stream(
+        self: Arc<Self>,
+        ctx: Context,
+        request: Request,
+        observer: Option<RunObserver>,
+    ) -> StepStream {
         // Stamp the algorithm's telemetry label into the request context; the
         // context rides on every driver call, so its telemetry is attributed.
         let mut ctx = ctx;
@@ -432,7 +493,7 @@ pub trait Algorithm: Send + Sync + 'static {
             observability::ALGORITHM_KEY.to_string(),
             self.name().to_string(),
         );
-        let driver = Driver::new();
+        let driver = Driver::with_observer(observer);
         let task_driver = driver.clone();
         let task_ctx = ctx.clone();
         let stream = task_driver.stream();
@@ -484,6 +545,16 @@ pub trait Algorithm: Send + Sync + 'static {
         ctx: Context,
         request: Request,
     ) -> Result<(Vec<Arc<dyn Decision>>, Response)> {
+        self.run_observed(ctx, request, None).await
+    }
+
+    /// Process a request to completion while reporting each model call to `observer`.
+    async fn run_observed(
+        self: Arc<Self>,
+        ctx: Context,
+        request: Request,
+        observer: Option<RunObserver>,
+    ) -> Result<(Vec<Arc<dyn Decision>>, Response)> {
         // Serve one offloaded call with its target's default client. A failed *model*
         // call is forwarded to the algorithm via `respond`; this errors only on an
         // infrastructure failure (no default client, or the promise was dropped).
@@ -518,7 +589,7 @@ pub trait Algorithm: Send + Sync + 'static {
             call.respond(result)
         }
 
-        let stream = self.run_stream(ctx, request);
+        let stream = self.run_stream(ctx, request, observer);
         tokio::pin!(stream);
 
         let mut trace: Vec<Arc<dyn Decision>> = Vec::new();
@@ -663,6 +734,34 @@ mod tests {
         LlmTargetSet::new(targets)
     }
 
+    #[tokio::test]
+    async fn observed_run_reports_one_successful_routed_call() -> Result<()> {
+        let observations = Arc::new(Mutex::new(Vec::new()));
+        let observed = observations.clone();
+        let observer: RunObserver = Arc::new(move |observation| observed.lock().push(observation));
+        let (_, response) = orch(target_set(&[("direct/model", true)]))
+            .run_observed(Context::default(), request(), Some(observer))
+            .await?;
+        assert_eq!(
+            response.llm_response.as_agg().map(completion_text),
+            Some("direct/model".to_string())
+        );
+        let observations = observations.lock();
+        assert_eq!(observations.len(), 2);
+        let RunObservation::LlmCall(observation) = &observations[0] else {
+            return Err(test_error("expected an LLM call observation"));
+        };
+        assert_eq!(observation.selected_model, "direct/model");
+        assert!(observation.is_routed);
+        assert!(observation.is_success);
+        assert!(observation.usage.is_some());
+        assert!(matches!(
+            observations[1],
+            RunObservation::RoutingOverhead(_)
+        ));
+        Ok(())
+    }
+
     #[test]
     fn target_lookup_returns_the_missing_target() {
         let error = target_set(&[]).get_target("missing").err();
@@ -764,8 +863,11 @@ mod tests {
     async fn run_offloads_via_promise_then_returns_to_agent() -> Result<()> {
         // A client-less target -> its call is offloaded via a promise the
         // orchestrator surfaces as a `CallLlm` step for us to fulfill.
-        let stream =
-            orch(target_set(&[("offload/model", false)])).run_stream(Context::default(), request());
+        let stream = orch(target_set(&[("offload/model", false)])).run_stream(
+            Context::default(),
+            request(),
+            None,
+        );
         tokio::pin!(stream);
 
         let mut saw_call = false;
@@ -812,8 +914,11 @@ mod tests {
     async fn client_backed_target_offloads_with_a_default_client() -> Result<()> {
         // Every call now offloads to the stream; a client-backed target rides its
         // client along as `default_client` so the consumer can serve it by default.
-        let stream =
-            orch(target_set(&[("direct/model", true)])).run_stream(Context::default(), request());
+        let stream = orch(target_set(&[("direct/model", true)])).run_stream(
+            Context::default(),
+            request(),
+            None,
+        );
         tokio::pin!(stream);
 
         let mut final_completion = None;
@@ -966,8 +1071,11 @@ mod tests {
         // A client-less target offloads its call; we fulfill the promise with an
         // Err, which must flow back through `call_llm_target` into the algorithm and
         // out as an error step — not a response.
-        let stream =
-            orch(target_set(&[("offload/model", false)])).run_stream(Context::default(), request());
+        let stream = orch(target_set(&[("offload/model", false)])).run_stream(
+            Context::default(),
+            request(),
+            None,
+        );
         tokio::pin!(stream);
 
         let mut saw_error = false;
@@ -1041,7 +1149,7 @@ mod tests {
             dropped: dropped.clone(),
         });
 
-        let stream = algo.run_stream(Context::default(), request());
+        let stream = algo.run_stream(Context::default(), request(), None);
         started_rx
             .recv()
             .await
@@ -1079,7 +1187,7 @@ mod tests {
         }
 
         let algo: Arc<dyn Algorithm> = Arc::new(Panicky);
-        let stream = algo.run_stream(Context::default(), request());
+        let stream = algo.run_stream(Context::default(), request(), None);
         tokio::pin!(stream);
 
         let mut saw_error = false;
