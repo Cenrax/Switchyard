@@ -81,10 +81,10 @@ impl OneShotServer {
         let request = self.receiver.recv_timeout(Duration::from_secs(5));
         match &request {
             Ok(_) | Err(RecvTimeoutError::Disconnected) => {
-                if let Some(handle) = self.handle.take() {
-                    if handle.join().is_err() {
-                        return Err(SwitchyardError::Other("server thread panicked".to_string()));
-                    }
+                if let Some(handle) = self.handle.take()
+                    && handle.join().is_err()
+                {
+                    return Err(SwitchyardError::Other("server thread panicked".to_string()));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}
@@ -148,10 +148,10 @@ impl SequenceServer {
         let requests = self.receiver.recv_timeout(Duration::from_secs(5));
         match &requests {
             Ok(_) | Err(RecvTimeoutError::Disconnected) => {
-                if let Some(handle) = self.handle.take() {
-                    if handle.join().is_err() {
-                        return Err(SwitchyardError::Other("server thread panicked".to_string()));
-                    }
+                if let Some(handle) = self.handle.take()
+                    && handle.join().is_err()
+                {
+                    return Err(SwitchyardError::Other("server thread panicked".to_string()));
                 }
             }
             Err(RecvTimeoutError::Timeout) => {}

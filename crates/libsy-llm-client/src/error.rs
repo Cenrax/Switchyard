@@ -35,10 +35,9 @@ where
             .get("error")
             .and_then(|err| err.get("message"))
             .and_then(Value::as_str)
+            && contains_any(message, phrases)
         {
-            if contains_any(message, phrases) {
-                return true;
-            }
+            return true;
         }
     }
     // Some upstream proxies return plain-text bodies; fall through to a string

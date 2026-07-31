@@ -4,14 +4,14 @@
 //! Thread-safe stats accumulator and serializable snapshot schema.
 
 use std::cmp::{Ordering, Reverse};
-use std::collections::{btree_map::Entry, BTreeMap, BinaryHeap, HashSet};
+use std::collections::{BTreeMap, BinaryHeap, HashSet, btree_map::Entry};
 use std::sync::Arc;
 
 use crate::Result;
 use parking_lot::{Mutex, MutexGuard};
 use serde::{Deserialize, Serialize};
 
-use super::cost::{estimate_cost, CostEstimate};
+use super::cost::{CostEstimate, estimate_cost};
 use super::{PrefixProbe, TokenUsage};
 
 const MAX_LATENCY_SAMPLES: usize = 10_000;
@@ -585,12 +585,11 @@ impl LatencyHistogram {
         let sample = Reverse(LatencySample(latency_ms));
         if self.samples.len() < MAX_LATENCY_SAMPLES {
             self.samples.push(sample);
-        } else if let Some(smallest_sample) = self.samples.peek() {
-            if latency_ms > smallest_sample.0.value() {
-                if let Some(mut smallest_sample) = self.samples.peek_mut() {
-                    *smallest_sample = sample;
-                }
-            }
+        } else if let Some(smallest_sample) = self.samples.peek()
+            && latency_ms > smallest_sample.0.value()
+            && let Some(mut smallest_sample) = self.samples.peek_mut()
+        {
+            *smallest_sample = sample;
         }
     }
 
