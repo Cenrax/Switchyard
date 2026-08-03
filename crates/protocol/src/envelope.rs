@@ -40,20 +40,24 @@ impl Context {
 #[derive(Clone)]
 pub struct Signals {}
 
-/// A request an algorithm routes: the normalized [`LlmRequest`] plus the original
-/// provider payload and correlation [`Metadata`].
+/// A request an algorithm routes: the normalized [`LlmRequest`] plus optional
+/// host-owned raw data and correlation [`Metadata`].
 #[derive(Clone, Default)]
 pub struct Request {
     /// The normalized request an algorithm routes.
     pub llm_request: LlmRequest,
-    /// The original provider-shaped request body, if the host wants to forward it
-    /// verbatim (e.g. a proxy preserving messages/params). libsy does not read it.
+    /// An optional whole request body retained by the host. libsy and the translation
+    /// codecs do not read it. Exact same-format codec replay instead uses
+    /// [`LlmRequest::preservation`].
     pub raw_request: Option<serde_json::Value>,
     /// Correlation metadata carried through the request.
     pub metadata: Option<Metadata>,
 }
 
 impl Request {
+    /// Returns the model name supplied by the inbound request, when present.
+    ///
+    /// This is not necessarily the target selected by a routing decision.
     pub fn requested_model(&self) -> Option<&str> {
         self.llm_request.model.as_deref()
     }
@@ -71,6 +75,10 @@ pub struct Response {
 }
 
 impl Response {
+    /// Returns the model recorded by a buffered response.
+    ///
+    /// Returns `None` for a live stream because inspecting its `MessageStart`
+    /// event would require consuming the stream.
     pub fn selected_model(&self) -> Option<&str> {
         self.llm_response.selected_model()
     }
