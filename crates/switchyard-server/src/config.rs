@@ -9,9 +9,9 @@ use std::path::Path;
 use std::sync::Arc;
 
 use libsy::{
-    Algorithm, EscalationJudgeConfig, HandoffNoteConfig, LlmFallback, LlmTarget, LlmTargetSet,
-    LlmTaskClassifier, Noop, Passthrough, PickerMode, Random, StageRouter, StageRouterConfig,
-    TargetPrompts, TaskClassifierConfig,
+    Algorithm, ClassifierContractConfig, EscalationJudgeConfig, HandoffNoteConfig, LlmFallback,
+    LlmTarget, LlmTargetSet, LlmTaskClassifier, Noop, Passthrough, PickerMode, Random, StageRouter,
+    StageRouterConfig, TargetPrompts, TaskClassifierConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -192,8 +192,21 @@ enum RouteConfig {
         classifier_target: String,
         strong_target: String,
         weak_target: String,
-        #[serde(flatten)]
-        classifier_config: TaskClassifierConfig,
+        base_threshold: f64,
+        #[serde(default)]
+        min_confidence: f64,
+        #[serde(default)]
+        capability_elevated_floor: Option<f64>,
+        #[serde(default)]
+        session_affinity: bool,
+        #[serde(default)]
+        message_hash_fallback: bool,
+        #[serde(default)]
+        recent_turn_window: Option<usize>,
+        #[serde(default)]
+        prompt: Option<String>,
+        #[serde(default = "default_classifier_max_output_tokens")]
+        max_output_tokens: u64,
         /// Present to route by escalation instead of up-front classification.
         ///
         /// The classifier target becomes a trajectory judge: every unlatched turn is served by
@@ -229,11 +242,40 @@ enum RouteConfig {
 
 /// The judge a `stage_router` route falls through to, and how it routes.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct StageClassifierConfig {
     /// Target the judge is called through. Not a routing destination.
     target: String,
-    #[serde(flatten)]
-    config: TaskClassifierConfig,
+    base_threshold: f64,
+    #[serde(default)]
+    min_confidence: f64,
+    #[serde(default)]
+    capability_elevated_floor: Option<f64>,
+    #[serde(default)]
+    session_affinity: bool,
+    #[serde(default)]
+    message_hash_fallback: bool,
+    #[serde(default)]
+    recent_turn_window: Option<usize>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default = "default_classifier_max_output_tokens")]
+    max_output_tokens: u64,
+}
+
+impl StageClassifierConfig {
+    fn task_classifier_config(&self) -> TaskClassifierConfig {
+        TaskClassifierConfig {
+            base_threshold: self.base_threshold,
+            min_confidence: self.min_confidence,
+            capability_elevated_floor: self.capability_elevated_floor,
+            session_affinity: self.session_affinity,
+            message_hash_fallback: self.message_hash_fallback,
+            recent_turn_window: self.recent_turn_window,
+            contract: classifier_contract(self.prompt.as_deref()),
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
 }
 
 impl RouteConfig {
@@ -332,25 +374,43 @@ fn build_algorithm(
             classifier_target,
             strong_target,
             weak_target,
-            classifier_config,
+            base_threshold,
+            min_confidence,
+            capability_elevated_floor,
+            session_affinity,
+            message_hash_fallback,
+            recent_turn_window,
+            prompt,
+            max_output_tokens,
             escalation,
             ..
         } => {
             let classifier = resolve_target(route_name, classifier_target, targets)?;
             let strong = resolve_target(route_name, strong_target, targets)?;
             let weak = resolve_target(route_name, weak_target, targets)?;
+            let classifier_config = TaskClassifierConfig {
+                base_threshold: *base_threshold,
+                min_confidence: *min_confidence,
+                capability_elevated_floor: *capability_elevated_floor,
+                session_affinity: *session_affinity,
+                message_hash_fallback: *message_hash_fallback,
+                recent_turn_window: *recent_turn_window,
+                contract: classifier_contract(prompt.as_deref()),
+                max_output_tokens: *max_output_tokens,
+            };
             // The weak model is the efficient tier; the strong model is the capable one.
             // With `escalation`, the classifier target judges the weak tier's reply each turn
             // instead of picking a tier ahead of it.
             let algorithm = match escalation {
-                Some(judge_config) => LlmTaskClassifier::new_with_escalation(
+                Some(judge_config) => LlmTaskClassifier::new_with_escalation_contract(
                     classifier,
                     weak,
                     strong,
+                    classifier_config.contract,
                     judge_config.clone(),
                     classifier_config.max_output_tokens,
                 ),
-                None => LlmTaskClassifier::new(classifier, weak, strong, classifier_config.clone()),
+                None => LlmTaskClassifier::new(classifier, weak, strong, classifier_config),
             }
             .map_err(|error| {
                 ServerError::new(format!("llm_classifier route {route_name}: {error}"))
@@ -388,7 +448,7 @@ fn build_algorithm(
                     resolve_target(route_name, &classifier.target, targets).map(|judge_target| {
                         LlmFallback {
                             judge_target,
-                            config: classifier.config.clone(),
+                            config: classifier.task_classifier_config(),
                         }
                     })
                 })
@@ -399,6 +459,16 @@ fn build_algorithm(
             Ok(Arc::new(algorithm))
         }
     }
+}
+
+fn classifier_contract(prompt: Option<&str>) -> ClassifierContractConfig {
+    prompt.map_or_else(ClassifierContractConfig::default, |prompt| {
+        ClassifierContractConfig::default().with_prompt(prompt)
+    })
+}
+
+fn default_classifier_max_output_tokens() -> u64 {
+    TaskClassifierConfig::default().max_output_tokens
 }
 
 /// Keys each configured system prompt by the target it belongs to.
@@ -567,6 +637,28 @@ target = "weak"
     }
 
     #[test]
+    fn classifier_prompts_are_configurable_in_both_modes() -> ServerResult<()> {
+        let capability = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nprompt = \"custom capability rubric\"",
+        );
+        server_state_from_toml(&capability)?;
+
+        let escalation = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nprompt = \"custom trajectory rubric\"\nescalation = { confirmations = 2 }",
+        );
+        server_state_from_toml(&escalation)?;
+
+        let empty = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nprompt = \"   \"",
+        );
+        assert!(error_message(&empty).contains("classifier prompt must not be empty"));
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_algorithm_types() {
         let unknown_field =
             VALID_CONFIG.replace("schema_version = 1", "schema_version = 1\nmagic = true");
@@ -578,8 +670,42 @@ target = "weak"
         );
         assert!(error_message(&nested_completion_cap).contains("unknown field"));
 
+        let unknown_classifier_field = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nclassifier_magic = true",
+        );
+        assert!(error_message(&unknown_classifier_field).contains("unknown field"));
+
         let unknown_algorithm = VALID_CONFIG.replace("type = \"noop\"", "type = \"imaginary\"");
         assert!(error_message(&unknown_algorithm).contains("unknown variant"));
+    }
+
+    #[test]
+    fn rejects_unknown_stage_classifier_fields() {
+        // Nested classifier typos must fail instead of silently using a default.
+        let config = format!(
+            r#"{VALID_CONFIG}
+
+[routes.stage]
+id = "switchyard/stage"
+type = "stage_router"
+capable_target = "strong"
+efficient_target = "weak"
+picker = "efficient_first"
+confidence_threshold = 1.0
+
+[routes.stage.classifier]
+target = "classifier"
+base_threshold = 0.5
+classifier_magic = true
+"#
+        );
+
+        let error = error_message(&config);
+        assert!(
+            error.contains("unknown field `classifier_magic`"),
+            "{error}"
+        );
     }
 
     #[test]
