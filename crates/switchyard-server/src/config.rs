@@ -348,6 +348,7 @@ fn build_algorithm(
                     weak,
                     strong,
                     judge_config.clone(),
+                    classifier_config.max_output_tokens,
                 ),
                 None => LlmTaskClassifier::new(classifier, weak, strong, classifier_config.clone()),
             }
@@ -550,10 +551,32 @@ target = "weak"
     }
 
     #[test]
+    fn classifier_judge_completion_caps_are_configurable() -> ServerResult<()> {
+        let capability = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nmax_output_tokens = 512",
+        );
+        server_state_from_toml(&capability)?;
+
+        let escalation = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nmax_output_tokens = 256\nescalation = { confirmations = 2 }",
+        );
+        server_state_from_toml(&escalation)?;
+        Ok(())
+    }
+
+    #[test]
     fn rejects_unknown_fields_and_algorithm_types() {
         let unknown_field =
             VALID_CONFIG.replace("schema_version = 1", "schema_version = 1\nmagic = true");
         assert!(error_message(&unknown_field).contains("unknown field"));
+
+        let nested_completion_cap = VALID_CONFIG.replace(
+            "base_threshold = 0.5",
+            "base_threshold = 0.5\nescalation = { max_output_tokens = 256 }",
+        );
+        assert!(error_message(&nested_completion_cap).contains("unknown field"));
 
         let unknown_algorithm = VALID_CONFIG.replace("type = \"noop\"", "type = \"imaginary\"");
         assert!(error_message(&unknown_algorithm).contains("unknown variant"));
@@ -597,6 +620,13 @@ target = "weak"
             (
                 VALID_CONFIG.replace("base_threshold = 0.5", "base_threshold = 1.5"),
                 "base_threshold must be between 0 and 1",
+            ),
+            (
+                VALID_CONFIG.replace(
+                    "base_threshold = 0.5",
+                    "base_threshold = 0.5\nmax_output_tokens = 0\nescalation = { confirmations = 2 }",
+                ),
+                "max_output_tokens must be at least 1",
             ),
             (
                 VALID_CONFIG.replace(

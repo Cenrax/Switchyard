@@ -36,21 +36,12 @@ const FIRST_USER_CHARS: usize = 2_000;
 /// Backstop on the assembled transcript; the per-message caps normally bind first.
 const MAX_REQUEST_CHARS: usize = 18_000;
 
-/// Completion budget for one judge reply. A runaway guard, not a budget: the benchmarked
-/// verdict runs ~40 tokens, and a cap costs nothing it does not generate.
-///
-/// Headroom this wide is for a judge deliberately opted back into thinking — hosts ask judge
-/// targets to answer without thinking first, but a judge that thinks and is cut off before
-/// answering has no verdict in `content` and fails open on every turn.
-const JUDGE_MAX_OUTPUT_TOKENS: u64 = 4_096;
-
 /// The tuning surface for the trajectory judge.
 ///
-/// Deliberately small: the three settings an audit of the Python router's twenty-odd knobs
-/// found to actually change routing outcomes. Everything else is a fixed invariant (the
-/// constants above). Defaults are the benchmarked configuration.
+/// The routing settings retain their benchmarked defaults. Everything else is a fixed invariant
+/// (the constants above).
 #[derive(Clone, Debug, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct EscalationJudgeConfig {
     /// Consecutive escalate verdicts required before a turn moves to the capable tier, which
     /// is also the turn that latches the session. Any decline clears the streak.
@@ -124,7 +115,7 @@ impl Judge for EscalationJudge {
                 ],
                 output: OutputParams {
                     response_format: self.rubric.response_schema.clone(),
-                    max_output_tokens: Some(JUDGE_MAX_OUTPUT_TOKENS),
+                    max_output_tokens: Some(self.rubric.max_output_tokens),
                 },
                 ..LlmRequest::default()
             },
@@ -171,9 +162,16 @@ pub(crate) fn build_judge(
     capable: String,
     efficient: String,
     config: EscalationJudgeConfig,
+    max_output_tokens: u64,
 ) -> Result<JudgeClassifier<EscalationJudge, EscalationPolicy>> {
     config.validate()?;
-    let rubric = llm_judge::load_judge_config(PROMPT_TEMPLATE, SCHEMA_TEMPLATE)?;
+    if max_output_tokens == 0 {
+        return Err(LibsyError::AlgorithmError {
+            message: "max_output_tokens must be at least 1".to_string(),
+        });
+    }
+    let mut rubric = llm_judge::load_judge_config(PROMPT_TEMPLATE, SCHEMA_TEMPLATE)?;
+    rubric.max_output_tokens = max_output_tokens;
     Ok(JudgeClassifier::new(
         EscalationJudge { rubric, config },
         judge_target,
@@ -388,9 +386,24 @@ mod tests {
         // Bounded output, so a reasoning judge cannot run away mid-verdict.
         assert_eq!(
             built.llm_request.output.max_output_tokens,
-            Some(JUDGE_MAX_OUTPUT_TOKENS)
+            Some(super::super::DEFAULT_JUDGE_MAX_OUTPUT_TOKENS)
         );
         assert!(built.llm_request.output.response_format.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn judge_request_uses_the_configured_completion_cap() -> Result<()> {
+        let mut rubric = llm_judge::load_judge_config(PROMPT_TEMPLATE, SCHEMA_TEMPLATE)?;
+        rubric.max_output_tokens = 512;
+        let judge = EscalationJudge {
+            rubric,
+            config: EscalationJudgeConfig::default(),
+        };
+
+        let built = judge.build_request(&State::default(), &request_at_turn(None, 1));
+
+        assert_eq!(built.llm_request.output.max_output_tokens, Some(512));
         Ok(())
     }
 
