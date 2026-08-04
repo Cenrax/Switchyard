@@ -39,6 +39,17 @@ impl FormatCodec for AnthropicMessagesCodec {
     fn decode_request(&self, body: &Value, policy: &TranslationPolicy) -> Result<DecodedRequest> {
         let body = crate::util::object(body, "$")?;
         let mut diagnostics = Vec::new();
+        let max_output_tokens = body
+            .get("max_tokens")
+            .map(|value| {
+                value
+                    .as_u64()
+                    .ok_or_else(|| TranslationError::InvalidValue {
+                        path: "$.max_tokens".to_string(),
+                        message: "expected a non-negative integer".to_string(),
+                    })
+            })
+            .transpose()?;
         let mut request = LlmRequest {
             model: body
                 .get("model")
@@ -46,7 +57,7 @@ impl FormatCodec for AnthropicMessagesCodec {
                 .filter(|model| !model.is_empty())
                 .map(ToOwned::to_owned),
             output: OutputParams {
-                max_output_tokens: body.get("max_tokens").and_then(Value::as_u64),
+                max_output_tokens,
                 response_format: None,
             },
             sampling: SamplingParams {
@@ -72,7 +83,7 @@ impl FormatCodec for AnthropicMessagesCodec {
             ..LlmRequest::default()
         };
         if let Some(system) = body.get("system")
-            && let Some(content) = decode_anthropic_system(system, &mut diagnostics, policy)?
+            && let Some(content) = decode_anthropic_system(system)?
         {
             request.instructions.push(InstructionBlock {
                 role: Role::System,
@@ -335,11 +346,7 @@ impl FormatCodec for AnthropicMessagesCodec {
 }
 
 // Decodes Anthropic's `system` field into instruction blocks.
-fn decode_anthropic_system(
-    value: &Value,
-    diagnostics: &mut Vec<TranslationDiagnostic>,
-    policy: &TranslationPolicy,
-) -> Result<Option<Vec<ContentBlock>>> {
+fn decode_anthropic_system(value: &Value) -> Result<Option<Vec<ContentBlock>>> {
     match value {
         Value::String(text) if !text.is_empty() => {
             Ok(Some(vec![ContentBlock::Text { text: text.clone() }]))
@@ -361,12 +368,10 @@ fn decode_anthropic_system(
             }
             Ok((!content.is_empty()).then_some(content))
         }
-        other => {
-            push_lossy(diagnostics, policy, "Anthropic system field was not text")?;
-            Ok(Some(vec![ContentBlock::Text {
-                text: string_value(other).unwrap_or_default(),
-            }]))
-        }
+        _ => Err(TranslationError::InvalidType {
+            path: "$.system".to_string(),
+            expected: "string or array of text blocks",
+        }),
     }
 }
 
