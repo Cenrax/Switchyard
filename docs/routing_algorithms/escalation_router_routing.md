@@ -88,6 +88,12 @@ A judge that times out, errors, or returns an unparseable verdict fails open: th
 turn serves the buffered weak reply and the existing streak is held rather than
 cleared. A judge failure never creates a strong-tier latch.
 
+## Judge model compatibility
+
+The trajectory judge uses the same response contract and provider/model
+compatibility guidance as the LLM classifier judge. See
+[Judge model compatibility](llm_classifier_routing.md#judge-model-compatibility).
+
 ## Tuning options
 
 The judge exposes three settings. Their defaults are the benchmarked
