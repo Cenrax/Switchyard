@@ -117,7 +117,7 @@ impl<S: Send> Processor<S> for SystemPromptProcessor {
         let Event::Decision { request, decision } = event else {
             return Ok(());
         };
-        let Some(prompt) = self.prompts.get(decision.selected_model()) else {
+        let Some(prompt) = self.prompts.get(decision.selected_model_id()) else {
             return Ok(());
         };
         // Ahead of the client's own instructions, so this framing is what the
@@ -139,7 +139,7 @@ impl<S: Send> Processor<S> for SystemPromptProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchyard_protocol::{LlmRequest, ToolResult, text_request};
+    use switchyard_protocol::{Decision, LlmRequest, ToolResult, text_request};
 
     const NOTE: &str = "recovering from an error";
     const STRONG_PROMPT: &str = "diagnose before you edit";
@@ -241,20 +241,6 @@ mod tests {
         );
     }
 
-    /// A decision routed to `target`.
-    struct RoutedTo(&'static str);
-    impl switchyard_protocol::Decision for RoutedTo {
-        fn selected_model(&self) -> &str {
-            self.0
-        }
-        fn reasoning(&self) -> Option<&str> {
-            None
-        }
-        fn as_any(&self) -> &dyn std::any::Any {
-            self
-        }
-    }
-
     /// The instruction text the request carries.
     fn instructions(request: &Request) -> Vec<String> {
         request
@@ -279,12 +265,13 @@ mod tests {
             },
             ..Request::default()
         };
+        let decision = Decision::new(target, None, true);
         processor
             .process(
                 &mut (),
                 Event::Decision {
                     request: &mut request,
-                    decision: &RoutedTo(target),
+                    decision: &decision,
                 },
             )
             .await?;
@@ -339,13 +326,14 @@ mod tests {
                 text: "you are a coding agent".to_string(),
             }],
         });
+        let decision = Decision::new("strong", None, true);
 
         processor
             .process(
                 &mut (),
                 Event::Decision {
                     request: &mut request,
-                    decision: &RoutedTo("strong"),
+                    decision: &decision,
                 },
             )
             .await?;

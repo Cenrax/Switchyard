@@ -275,7 +275,6 @@ async fn stats_exposes_the_exact_empty_schema_and_no_legacy_alias() -> TestResul
             "total_errors": 0,
             "total_tokens": empty_token_totals(),
             "models": {},
-            "tiers": {},
             "routing_overhead": {
                 "count": 0,
                 "total_ms": 0.0,
@@ -390,7 +389,6 @@ async fn stats_reset_returns_confirmation_and_clears_all_stats() -> TestResult {
     assert_eq!(stats["total_errors"], 0);
     assert_eq!(stats["total_tokens"], empty_token_totals());
     assert_eq!(stats["models"], json!({}));
-    assert_eq!(stats["tiers"], json!({}));
     assert_eq!(stats["routing_overhead"]["count"], 0);
     assert_eq!(stats["classifier"]["total_requests"], 0);
     assert_eq!(stats["classifier"]["models"], json!({}));
@@ -905,7 +903,6 @@ base_threshold = 0.5
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
     assert_eq!(stats["total_requests"], 3);
     assert_eq!(stats["models"]["model/weak"]["calls"], 3);
-    assert_eq!(stats["tiers"]["weak"]["calls"], 1);
     assert_eq!(stats["classifier"]["total_requests"], 1);
     assert_eq!(
         stats["classifier"]["models"]["model/classifier"]["calls"],
@@ -1672,7 +1669,9 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
                 .headers
                 .get("x-model-router-rationale")
                 .and_then(|value| value.to_str().ok()),
-            Some("model/weak was unavailable; fell back to model/strong")
+            Some(
+                "model/weak was unavailable; fell back to model/strong (fallback reason: unavailable)"
+            )
         );
         let calls = upstream.calls.lock().await;
         assert_eq!(
@@ -1685,7 +1684,8 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
     }
 
     let stats = send(&app, "GET", "/v1/stats", None).await?.json()?;
-    assert_eq!(stats["routing_fallbacks"]["unavailable"], 3);
+    // Fallback cause is now carried in decision reasoning rather than structured stats/logs.
+    assert_eq!(stats["routing_fallbacks"]["unavailable"], 0);
     assert_eq!(stats["routing_fallbacks"]["context_window"], 0);
 
     let records = std::fs::read_to_string(&log_path)?;
@@ -1695,7 +1695,7 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
         .collect::<Result<Vec<_>, _>>()?;
     assert_eq!(records.len(), 3);
     assert!(records.iter().all(|record| {
-        record["model"] == "model/strong" && record["fallback_reason"] == "unavailable"
+        record["model"] == "model/strong" && record.get("fallback_reason").is_none()
     }));
 
     let previous_call_count = upstream.calls.lock().await.len();
