@@ -219,10 +219,14 @@ impl ServerState {
             return Err(ServerError::new("at least one algorithm route is required"));
         }
         let metrics = metrics::registry().map_err(ServerError::new)?;
+        let stats = StatsAccumulator::new(
+            metrics.clone(),
+            entries.values().map(|entry| entry.algorithm.name()),
+        );
         Ok(Self {
             routes: Arc::new(entries),
             metrics,
-            stats: StatsAccumulator::default(),
+            stats,
             routing_log: None,
             track_cache_eligibility: tracking_enabled_from_env(),
         })
