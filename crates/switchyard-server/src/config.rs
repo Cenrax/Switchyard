@@ -10,9 +10,9 @@ use std::sync::Arc;
 
 use libsy::{
     Algorithm, ClassifierContractConfig, CustomClassifierConfig, CustomClassifierPolicy,
-    EscalationJudgeConfig, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTarget,
-    LlmTargetSet, LlmTaskClassifier, Noop, Passthrough, PickerMode, Random, StageRouter,
-    StageRouterConfig, TargetPrompts, TaskClassifierConfig,
+    EscalationJudgeConfig, HandoffNoteConfig, LlmClassifierConfig, LlmFallback, LlmTaskClassifier,
+    Noop, Passthrough, PickerMode, Random, StageRouter, StageRouterConfig, TargetPrompts,
+    TaskClassifierConfig,
 };
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,7 +20,7 @@ use switchyard_llm_client::{
     Backend, ClientRouter, DEFAULT_MAX_RETRIES, HttpBackendConfig, ModelConfig,
     TranslatingLlmClient,
 };
-use switchyard_protocol::RoutedLlmClient;
+use switchyard_protocol::{ModelId, RoutedLlmClient};
 
 use crate::{CountTokensTarget, ModelCapabilities, ServerError, ServerResult, ServerState};
 
@@ -102,7 +102,7 @@ impl ServerConfig {
             let client = self.build_client_router(config, &clients)?;
             let count_tokens_target = self.build_count_tokens_target(config, &clients);
             routes.push((
-                config.id().to_string(),
+                config.id().clone(),
                 algorithm,
                 client,
                 capabilities,
@@ -133,7 +133,7 @@ impl ServerConfig {
                 .get_mut(&target.llm_client)
                 .ok_or_else(|| ServerError::new("validated llm client was not initialized"))?;
             model_configs.push(ModelConfig::new(
-                &target.id,
+                target.id.clone(),
                 build_backend(&target.llm_client, client_config, &target.extra_body)?,
                 None,
             ));
@@ -150,18 +150,11 @@ impl ServerConfig {
         Ok(clients)
     }
 
-    fn build_targets(&self) -> ServerResult<BTreeMap<String, LlmTarget>> {
+    fn build_targets(&self) -> ServerResult<BTreeMap<String, ModelId>> {
         Ok(self
             .targets
             .iter()
-            .map(|(name, config)| {
-                (
-                    name.clone(),
-                    LlmTarget {
-                        semantic_name: config.id.clone(),
-                    },
-                )
-            })
+            .map(|(name, config)| (name.clone(), config.id.clone()))
             .collect())
     }
 
@@ -225,7 +218,7 @@ impl ServerConfig {
 }
 
 // Prefer known Claude families, then preserve the route's target order.
-fn count_tokens_priority(target_name: &str, model_id: &str) -> usize {
+fn count_tokens_priority(target_name: &str, model_id: &ModelId) -> usize {
     let target_name = target_name.to_ascii_lowercase();
     let model_id = model_id.to_ascii_lowercase();
     ["opus", "sonnet", "haiku"]
@@ -249,7 +242,7 @@ struct LlmClientConfig {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct TargetConfig {
-    id: String,
+    id: ModelId,
     llm_client: String,
     #[serde(default)]
     extra_body: BTreeMap<String, Value>,
@@ -333,7 +326,7 @@ struct CustomClassifierRouteConfig {
 #[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
 enum RouteConfig {
     Noop {
-        id: String,
+        id: ModelId,
         #[serde(default)]
         context_window: Option<u32>,
         #[serde(default)]
@@ -342,7 +335,7 @@ enum RouteConfig {
         reasoning: Option<bool>,
     },
     Random {
-        id: String,
+        id: ModelId,
         #[serde(default)]
         context_window: Option<u32>,
         #[serde(default)]
@@ -354,7 +347,7 @@ enum RouteConfig {
         seed: Option<u64>,
     },
     Passthrough {
-        id: String,
+        id: ModelId,
         #[serde(default)]
         context_window: Option<u32>,
         #[serde(default)]
@@ -364,7 +357,7 @@ enum RouteConfig {
         target: String,
     },
     LlmClassifier {
-        id: String,
+        id: ModelId,
         #[serde(default)]
         context_window: Option<u32>,
         #[serde(default)]
@@ -404,7 +397,7 @@ enum RouteConfig {
         policy: Option<ClassifierPolicyConfig>,
     },
     StageRouter {
-        id: String,
+        id: ModelId,
         #[serde(default)]
         context_window: Option<u32>,
         #[serde(default)]
@@ -469,7 +462,7 @@ impl StageClassifierConfig {
 }
 
 impl RouteConfig {
-    fn id(&self) -> &str {
+    fn id(&self) -> &ModelId {
         use RouteConfig::*;
         match self {
             Noop { id, .. }
@@ -821,7 +814,7 @@ const fn default_max_retries() -> u32 {
 fn build_algorithm(
     route_name: &str,
     config: &RouteConfig,
-    targets: &BTreeMap<String, LlmTarget>,
+    targets: &BTreeMap<String, ModelId>,
 ) -> ServerResult<Arc<dyn Algorithm>> {
     match config {
         RouteConfig::Noop { .. } => Ok(Arc::new(Noop {})),
@@ -838,18 +831,19 @@ fn build_algorithm(
             Ok(Arc::new(algorithm))
         }
         RouteConfig::Passthrough { target, .. } => {
-            let target = resolve_target(route_name, target, targets)?;
+            let target = resolve_target_model_id(route_name, target, targets)?;
             Ok(Arc::new(Passthrough::new(target)))
         }
         RouteConfig::LlmClassifier {
             classifier_target, ..
         } => {
-            let classifier = resolve_target(route_name, classifier_target, targets)?;
+            let classifier = resolve_target_model_id(route_name, classifier_target, targets)?;
             let mode = config.classifier_mode(route_name)?;
             let algorithm = match mode {
                 LlmClassifierModeConfig::Capability(config) => {
-                    let strong = resolve_target(route_name, &config.strong_target, targets)?;
-                    let weak = resolve_target(route_name, &config.weak_target, targets)?;
+                    let strong =
+                        resolve_target_model_id(route_name, &config.strong_target, targets)?;
+                    let weak = resolve_target_model_id(route_name, &config.weak_target, targets)?;
                     let classifier_config = TaskClassifierConfig {
                         base_threshold: config.base_threshold,
                         threshold_step: config.threshold_step,
@@ -867,8 +861,9 @@ fn build_algorithm(
                     })
                 }
                 LlmClassifierModeConfig::Escalation(config) => {
-                    let strong = resolve_target(route_name, &config.strong_target, targets)?;
-                    let weak = resolve_target(route_name, &config.weak_target, targets)?;
+                    let strong =
+                        resolve_target_model_id(route_name, &config.strong_target, targets)?;
+                    let weak = resolve_target_model_id(route_name, &config.weak_target, targets)?;
                     LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
                         judge_target: classifier,
                         efficient_target: weak,
@@ -883,7 +878,7 @@ fn build_algorithm(
                         .targets
                         .iter()
                         .map(|name| {
-                            resolve_target(route_name, name, targets)
+                            resolve_target_model_id(route_name, name, targets)
                                 .map(|target| (name.clone(), target))
                         })
                         .collect::<ServerResult<Vec<_>>>()?;
@@ -933,15 +928,15 @@ fn build_algorithm(
                     "stage_router route {route_name} uses picker \"capable_first\", which is experimental: published thresholds and routing results all come from \"efficient_first\", so there is no calibrated confidence_threshold for it and no measured accuracy or cost. Use \"efficient_first\" unless you are running your own calibration."
                 );
             }
-            let capable = resolve_target(route_name, capable_target, targets)?;
-            let efficient = resolve_target(route_name, efficient_target, targets)?;
+            let capable = resolve_target_model_id(route_name, capable_target, targets)?;
+            let efficient = resolve_target_model_id(route_name, efficient_target, targets)?;
             let mut config = StageRouterConfig::new(*picker, *confidence_threshold);
             config.recent_window = *recent_turn_window;
             config.handoff_notes = handoff_notes.clone();
             config.tier_prompts = tier_prompts(
-                &capable.semantic_name,
+                &capable,
                 capable_system_prompt.as_deref(),
-                &efficient.semantic_name,
+                &efficient,
                 efficient_system_prompt.as_deref(),
             );
             // The judge is called through its own target, so it is not a routing
@@ -949,12 +944,12 @@ fn build_algorithm(
             config.llm_fallback = classifier
                 .as_ref()
                 .map(|classifier| {
-                    resolve_target(route_name, &classifier.target, targets).map(|judge_target| {
-                        LlmFallback {
+                    resolve_target_model_id(route_name, &classifier.target, targets).map(
+                        |judge_target| LlmFallback {
                             judge_target,
                             config: classifier.task_classifier_config(),
-                        }
-                    })
+                        },
+                    )
                 })
                 .transpose()?;
             let algorithm = StageRouter::new(capable, efficient, config).map_err(|error| {
@@ -995,20 +990,19 @@ fn tier_prompts(
 fn resolve_targets<'a>(
     route_name: &str,
     names: impl IntoIterator<Item = &'a str>,
-    targets: &BTreeMap<String, LlmTarget>,
-) -> ServerResult<LlmTargetSet> {
-    let resolved = names
+    targets: &BTreeMap<String, ModelId>,
+) -> ServerResult<Vec<ModelId>> {
+    names
         .into_iter()
-        .map(|name| resolve_target(route_name, name, targets))
-        .collect::<ServerResult<Vec<_>>>()?;
-    Ok(LlmTargetSet::new(resolved))
+        .map(|name| resolve_target_model_id(route_name, name, targets))
+        .collect()
 }
 
-fn resolve_target(
+fn resolve_target_model_id(
     route_name: &str,
     name: &str,
-    targets: &BTreeMap<String, LlmTarget>,
-) -> ServerResult<LlmTarget> {
+    targets: &BTreeMap<String, ModelId>,
+) -> ServerResult<ModelId> {
     targets.get(name).cloned().ok_or_else(|| {
         ServerError::new(format!(
             "route {route_name} references unknown target {name}"

@@ -37,7 +37,7 @@ use parking_lot::Mutex;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use switchyard_llm_client::{ClientRouter, RunObservation, RunObserver, TranslatingLlmClient};
-use switchyard_protocol::{Decision, LlmClientError, Metadata, Request, Usage};
+use switchyard_protocol::{Decision, LlmClientError, Metadata, ModelId, Request, Usage};
 use tokio::net::{TcpListener, TcpSocket};
 use tokio::task;
 use tracing::{Instrument, Level};
@@ -117,7 +117,7 @@ struct RouteEntry {
 /// Exact upstream model used by the server's Anthropic token-count endpoint.
 #[derive(Clone)]
 struct CountTokensTarget {
-    model: String,
+    model: ModelId,
     client: Arc<TranslatingLlmClient>,
 }
 
@@ -130,7 +130,7 @@ impl CountTokensTarget {
 /// Shared server state used by all endpoint handlers.
 #[derive(Clone)]
 pub struct ServerState {
-    routes: Arc<BTreeMap<String, RouteEntry>>,
+    routes: Arc<BTreeMap<ModelId, RouteEntry>>,
     metrics: prometheus::Registry,
     stats: StatsAccumulator,
     routing_log: Option<SharedRoutingLog>,
@@ -175,7 +175,7 @@ impl ServerState {
     /// Creates server state from route model IDs, their libsy algorithms, and the
     /// per-target client routing each route's calls are resolved through.
     pub fn new(
-        routes: impl IntoIterator<Item = (String, Arc<dyn Algorithm>, ClientRouter)>,
+        routes: impl IntoIterator<Item = (ModelId, Arc<dyn Algorithm>, ClientRouter)>,
     ) -> ServerResult<Self> {
         Self::new_with_capabilities(routes.into_iter().map(|(model, algorithm, clients)| {
             (
@@ -191,7 +191,7 @@ impl ServerState {
     fn new_with_capabilities(
         routes: impl IntoIterator<
             Item = (
-                String,
+                ModelId,
                 Arc<dyn Algorithm>,
                 ClientRouter,
                 ModelCapabilities,
@@ -201,7 +201,7 @@ impl ServerState {
     ) -> ServerResult<Self> {
         let mut entries = BTreeMap::new();
         for (model, algorithm, target_clients, capabilities, count_tokens_target) in routes {
-            let model = model.trim();
+            let model = ModelId::from(model.trim());
             if model.is_empty() {
                 return Err(ServerError::new("route model must not be empty"));
             }
@@ -211,7 +211,7 @@ impl ServerState {
                 capabilities,
                 count_tokens_target,
             };
-            if entries.insert(model.to_string(), entry).is_some() {
+            if entries.insert(model.clone(), entry).is_some() {
                 return Err(ServerError::new(format!("duplicate route model {model}")));
             }
         }
@@ -240,7 +240,7 @@ impl ServerState {
 
     /// Returns the route model IDs served by the configured algorithms.
     pub fn models(&self) -> impl Iterator<Item = &str> {
-        self.routes.keys().map(String::as_str)
+        self.routes.keys().map(ModelId::as_str)
     }
 
     fn route_for_model(&self, model: &str) -> Option<&RouteEntry> {
@@ -1327,7 +1327,7 @@ mod tests {
 
         let call = |model: &str, is_answer_call: bool| {
             RunObservation::LlmCall(LlmCallObservation {
-                selected_model: model.to_string(),
+                selected_model: ModelId::from(model),
                 is_answer_call,
                 is_success: true,
                 duration: Duration::from_millis(3),
