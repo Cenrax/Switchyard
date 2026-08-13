@@ -180,10 +180,6 @@ impl Decision {
 /// not serialize requests unless their transport requires it.
 #[async_trait]
 pub trait RoutedLlmClient: Send + Sync {
-    /// Serve the model identified by
-    /// [`decision.selected_model_id()`](Decision::selected_model_id), resolving it to the
-    /// provider model this client calls.
-    /// `request.llm_request.model` is the agent's original name, carried through for
-    /// reference, not a call target.
-    async fn call(&self, request: Request, decision: Decision) -> Result<Response, LlmClientError>;
+    /// Make a request
+    async fn call(&self, request: Request) -> Result<Response, LlmClientError>;
 }
