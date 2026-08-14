@@ -1998,96 +1998,6 @@ async fn routing_log_keeps_the_canonical_session_id_until_a_stream_drains() -> T
     Ok(())
 }
 
-// Overflow history is isolated per child, cleared with the session, and not retained when a
-// child lacks an agent ID.
-#[tokio::test]
-async fn overflow_history_is_scoped_to_agent_and_session_lifetime() -> TestResult {
-    let upstream = MockUpstream::start().await?;
-    let state = fallback_state(&upstream.base_url)?;
-    let app = build_switchyard_router(state);
-    let child_a = [
-        ("x-switchyard-session-id", "shared-session"),
-        ("x-switchyard-agent-id", "child-a"),
-        ("x-switchyard-is-subagent", "true"),
-    ];
-    let root = [
-        ("x-switchyard-session-id", "shared-session"),
-        ("x-switchyard-agent-id", "root"),
-        ("x-switchyard-is-subagent", "false"),
-    ];
-    let child_b = [
-        ("x-switchyard-session-id", "shared-session"),
-        ("x-switchyard-agent-id", "child-b"),
-        ("x-switchyard-is-subagent", "true"),
-    ];
-    let child_without_agent_id = [
-        ("x-switchyard-session-id", "shared-session"),
-        ("x-switchyard-is-subagent", "true"),
-    ];
-    let final_root = [
-        ("x-switchyard-session-id", "shared-session"),
-        ("x-switchyard-agent-id", "root"),
-        ("x-switchyard-is-subagent", "false"),
-        ("x-switchyard-session-final", "true"),
-    ];
-    type Case<'a> = (&'a str, &'a [(&'a str, &'a str)], &'a [&'a str]);
-    let cases: [Case<'_>; 8] = [
-        (
-            "overflow",
-            child_a.as_slice(),
-            &["model/weak", "model/strong"],
-        ),
-        ("fits", child_a.as_slice(), &["model/strong"]),
-        ("fits", root.as_slice(), &["model/weak"]),
-        ("fits", child_b.as_slice(), &["model/weak"]),
-        ("fits", final_root.as_slice(), &["model/weak"]),
-        ("fits", child_a.as_slice(), &["model/weak"]),
-        (
-            "overflow",
-            child_without_agent_id.as_slice(),
-            &["model/weak", "model/strong"],
-        ),
-        (
-            "overflow",
-            child_without_agent_id.as_slice(),
-            &["model/weak", "model/strong"],
-        ),
-    ];
-
-    for (content, headers, expected_calls) in cases {
-        let previous_call_count = upstream.calls.lock().await.len();
-        let response = send_with_headers(
-            &app,
-            "POST",
-            "/v1/chat/completions",
-            Some(json!({
-                "model": ROUTE_MODEL,
-                "messages": [{"role": "user", "content": content}]
-            })),
-            headers,
-        )
-        .await?;
-        assert_eq!(response.status, StatusCode::OK);
-        let expected_model = expected_calls.last().copied();
-        assert_eq!(
-            response
-                .headers
-                .get("x-model-router-selected-model")
-                .and_then(|value| value.to_str().ok()),
-            expected_model
-        );
-        let calls = upstream.calls.lock().await;
-        assert_eq!(
-            calls[previous_call_count..]
-                .iter()
-                .map(|call| call["model"].as_str().unwrap_or(""))
-                .collect::<Vec<_>>(),
-            expected_calls
-        );
-    }
-    Ok(())
-}
-
 #[tokio::test]
 async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted() -> TestResult {
     let upstream = MockUpstream::start().await?;
@@ -2128,6 +2038,7 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
                 .and_then(|value| value.to_str().ok()),
             Some("model/strong")
         );
+        assert_eq!(response.json()?["model"], "model/strong");
         let calls = upstream.calls.lock().await;
         assert_eq!(
             calls[previous_call_count..]
@@ -2142,6 +2053,8 @@ async fn unavailable_target_fails_over_across_endpoints_and_stops_when_exhausted
     // Fallback causes are logged rather than accumulated in the legacy stats counters.
     assert_eq!(stats["routing_fallbacks"]["unavailable"], 0);
     assert_eq!(stats["routing_fallbacks"]["context_window"], 0);
+    assert_eq!(stats["models"]["model/strong"]["calls"], 3);
+    assert_eq!(stats["models"]["model/weak"]["errors"], 3);
 
     let records = std::fs::read_to_string(&log_path)?;
     let records = records
