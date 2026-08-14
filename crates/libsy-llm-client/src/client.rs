@@ -26,12 +26,8 @@ use crate::error::{LlmClientError, Result};
 use crate::metrics;
 use crate::raw::RawResponse;
 
-// TODO: Why is this here? What does it do?
-// Headers this client owns or that are hop-by-hop; never forwarded from the
-// caller's metadata. Auth/version/content-type are set by the backend or the
-// JSON body, so a forwarded copy would either be ignored or conflict. Compared
-// case-insensitively. Aligns with `_SENSITIVE_HEADERS` in the Python
-// `switchyard/lib/request_metadata.py` forwarding logic.
+// Headers this client owns or that are hop-by-hop. Backends apply an explicitly
+// enabled caller credential after generic metadata forwarding skips these.
 const RESERVED_HEADERS: &[&str] = &[
     "host",
     "content-length",
@@ -42,6 +38,8 @@ const RESERVED_HEADERS: &[&str] = &[
     "cookie",
     "set-cookie",
     "x-api-key",
+    "chatgpt-account-id",
+    "x-openai-fedramp",
     "anthropic-beta",
     "anthropic-version",
     "content-type",
@@ -88,6 +86,7 @@ impl ModelConfig {
 pub struct TranslatingLlmClient {
     model_to_config: HashMap<ModelId, ModelConfig>,
     client: reqwest::Client,
+    forward_auth_client: reqwest::Client,
 }
 
 impl TranslatingLlmClient {
@@ -102,12 +101,16 @@ impl TranslatingLlmClient {
                 backend.validate_extra_headers(&config.model_name)?;
             }
         }
-        let client =
-            reqwest::Client::builder()
-                .build()
-                .map_err(|error| LlmClientError::Transport {
-                    source: Box::new(error),
-                })?;
+        let build_client = |builder: reqwest::ClientBuilder| {
+            builder.build().map_err(|error| LlmClientError::Transport {
+                source: Box::new(error),
+            })
+        };
+        let client = build_client(reqwest::Client::builder())?;
+        // A redirect could move provider-specific headers to another origin.
+        // Forwarded credentials are sent only to the configured URL.
+        let forward_auth_client =
+            build_client(reqwest::Client::builder().redirect(reqwest::redirect::Policy::none()))?;
         let model_to_config = model_configs
             .iter()
             .map(|config| (config.model_name.clone(), config.clone()))
@@ -116,6 +119,7 @@ impl TranslatingLlmClient {
         Ok(Self {
             model_to_config,
             client,
+            forward_auth_client,
         })
     }
 
@@ -286,8 +290,14 @@ impl TranslatingLlmClient {
         model: &ModelId,
         streaming: bool,
     ) -> std::result::Result<EncodedResponse, AttemptFailure> {
-        let builder = self.client.post(url).json(body);
+        let client = if backend.is_forwarding_auth() {
+            &self.forward_auth_client
+        } else {
+            &self.client
+        };
+        let builder = client.post(url).json(body);
         let builder = forward_metadata_headers(builder, metadata);
+        let builder = backend.apply_forwarded_auth(builder, metadata);
         let builder = apply_extra_headers(builder, backend);
         let builder = backend.apply_auth(builder);
 
@@ -339,6 +349,7 @@ impl TranslatingLlmClient {
                 });
             }
         };
+        let body = backend.redact_forwarded_auth(body, metadata);
         metrics::record_upstream_attempt(Some(status.as_u16()));
         let error =
             if status == reqwest::StatusCode::BAD_REQUEST && backend.is_context_overflow(&body) {
@@ -631,7 +642,7 @@ fn convert_reqwest_error(error: reqwest::Error) -> LlmClientError {
     }
 }
 
-// Forwards caller-supplied metadata headers, skipping the reserved set.
+// Forwards caller-supplied metadata headers except credentials and client-owned headers.
 fn forward_metadata_headers(
     mut builder: RequestBuilder,
     metadata: Option<&Metadata>,
@@ -818,6 +829,7 @@ mod tests {
         HttpBackendConfig {
             base_url: base_url.to_string(),
             api_key: Some("secret".to_string()),
+            forward_auth: false,
             extra_headers: BTreeMap::new(),
             extra_body: BTreeMap::new(),
             max_retries: 0,

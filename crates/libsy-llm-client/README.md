@@ -65,6 +65,7 @@ fn build_client() -> switchyard_llm_client::Result<TranslatingLlmClient> {
     let openai = HttpBackendConfig {
         base_url: "https://api.openai.com/v1".to_string(),
         api_key: std::env::var("OPENAI_API_KEY").ok(),
+        forward_auth: false,
         extra_headers: BTreeMap::new(),
         extra_body: BTreeMap::new(),
         max_retries: 2,
@@ -231,8 +232,13 @@ fn build_multi_format_client(
   Anthropic sends `x-api-key: <key>` plus `anthropic-version`.
 - `request.metadata.http_headers` are forwarded upstream, **except** reserved ones:
   `host`, `content-length`, `connection`, and the backend-owned
-  `authorization` / `x-api-key` / `anthropic-version` / `content-type`. So a
-  caller's placeholder credential never overrides the backend's real key.
+  login, API-key, version, and content headers. So a caller's placeholder
+  credential never overrides the backend's real key.
+- `HttpBackendConfig::forward_auth` uses the caller's credential instead of the
+  backend's configured key. OpenAI backends forward `authorization`,
+  `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic backends forward
+  `authorization` or `x-api-key`; they also keep `oauth-*` values from
+  `anthropic-beta` and remove other caller-supplied beta values.
 - Per-backend custom headers go in `HttpBackendConfig::extra_headers`. Set credentials with
   `api_key`. OpenAI backends reject `Authorization`; Anthropic backends reject `x-api-key`
   and `anthropic-version`. Header names are case-insensitive.

@@ -45,11 +45,36 @@ route reaches no upstream. A file without a `[targets]` table is rejected with
 | `format` | Yes | — | `openai_chat`, `openai_responses`, or `anthropic_messages`. |
 | `base_url` | Yes | — | Upstream base URL. |
 | `api_key_env` | No | unset | Name of the environment variable holding the key. Omit to send no authentication. |
-| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env`. The server rejects `Authorization` for OpenAI clients and `x-api-key` or `anthropic-version` for Anthropic clients when it loads the config. Header names are case-insensitive. |
+| `forward_auth` | No | `false` | Forward the caller's provider credential to this upstream. |
+| `extra_headers` | No | `{}` | Custom HTTP headers sent to the model server. Set credentials with `api_key_env` or `forward_auth`; the server rejects headers owned by the selected auth mode. Header names are case-insensitive. |
 | `max_retries` | No | `2` | Retry budget, `0`–`10`. |
 
 The TOML never contains the secret itself. `api_key_env` names a variable that
 must exist and be non-empty when the server loads.
+
+Set `forward_auth = true` to use each caller's credential instead of a
+server-owned key:
+
+```toml
+[llm_clients.claude]
+format = "anthropic_messages"
+base_url = "https://api.anthropic.com"
+forward_auth = true
+```
+
+`forward_auth` cannot be combined with `api_key_env`. OpenAI clients forward
+`authorization`, `chatgpt-account-id`, and `x-openai-fedramp`. Anthropic clients
+forward `authorization` or `x-api-key`; for Claude subscription OAuth, they also
+forward `oauth-*` values from `anthropic-beta` and remove all other inbound beta
+values.
+
+This setting gives `base_url` the caller's login. Enable it only when that
+upstream should receive the credential, and use HTTPS unless the upstream runs
+on loopback. Forwarding clients do not follow HTTP redirects. Check every
+forwarding client used by a route, including classifier and judge targets. The
+server rejects an Anthropic forwarding route called through an OpenAI endpoint,
+or an OpenAI forwarding route called through an Anthropic endpoint, before it
+calls an upstream.
 
 ## `[targets.<name>]`
 
