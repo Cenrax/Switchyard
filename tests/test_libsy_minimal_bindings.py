@@ -181,6 +181,66 @@ async def test_classifier_config_accepts_a_prompt_override() -> None:
     assert response["model"] == "weak"
 
 
+async def test_classifier_config_accepts_json_object_output() -> None:
+    """Verify that Python can select JSON Object mode for a classifier judge."""
+
+    class JudgeClient(EchoClient):
+        async def call(self, request: dict[str, Any]) -> dict[str, Any]:
+            self.calls.append(request)
+            return {
+                "model": self.model,
+                "outputs": [
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    '{"crux":"bounded task","primary_rule":"SUP-1",'
+                                    '"capability_boundary":"supported","p_solve":0.9}'
+                                ),
+                            }
+                        ],
+                        "stop_reason": "end_turn",
+                    }
+                ],
+            }
+
+    judge = JudgeClient("judge")
+    weak = EchoClient("weak")
+    algorithm = algorithms.llm_task_classifier(
+        "judge",
+        "weak",
+        "strong",
+        config=TaskClassifierConfig(0.5, response_format_type="json_object"),
+    )
+
+    _, response = await run_algorithm(
+        algorithm,
+        {
+            "judge": judge,
+            "weak": weak,
+            "strong": EchoClient("strong"),
+        },
+    )
+
+    assert judge.calls[0]["output"]["response_format"] == {"type": "json_object"}
+    prompt = judge.calls[0]["instructions"][0]["content"][0]["text"]
+    assert "JSON Schema" in prompt
+    assert '"p_solve"' in prompt
+    assert response["model"] == "weak"
+
+
+def test_classifier_config_rejects_unknown_response_format() -> None:
+    invalid_response_format: Any = "yaml"
+
+    with pytest.raises(
+        ValueError,
+        match="response_format_type must be 'json_schema' or 'json_object'",
+    ):
+        TaskClassifierConfig(0.5, response_format_type=invalid_response_format)
+
+
 async def test_random_weights_and_seed_are_reproducible() -> None:
     def algorithm():
         return algorithms.random(

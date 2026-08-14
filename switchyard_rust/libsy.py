@@ -95,6 +95,7 @@ if TYPE_CHECKING:
             recent_turn_window: int | None = None,
             max_output_tokens: int = 4096,
             prompt: str | None = None,
+            response_format_type: Literal["json_schema", "json_object"] = "json_schema",
         ) -> None: ...
 
     @final
