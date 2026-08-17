@@ -3,11 +3,15 @@
 
 //! Tests for buffered request translation between provider formats.
 
+pub mod common;
+
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use switchyard_translation::{
     LossyConversionPolicy, TranslationEngine, TranslationPolicy, WireFormat,
 };
+
+use common::{REASONING_MODEL, normalized_policy, shell_tool_call};
 
 type TestResult = std::result::Result<(), Box<dyn std::error::Error + Send + Sync>>;
 
@@ -1000,6 +1004,7 @@ fn responses_reasoning_items_attach_to_tool_call_turn_for_openai_chat() -> TestR
     );
     assert_eq!(messages.len(), 4);
     assert_eq!(messages[1], json!({"role": "assistant", "content": "\n\n"}));
+    assert_eq!(messages[2]["reasoning"], "Check the python setup.");
     assert_eq!(messages[2]["tool_calls"][0]["id"], "call-1");
     assert_eq!(messages[3]["role"], "tool");
     Ok(())
@@ -1035,9 +1040,99 @@ fn responses_reasoning_item_merges_into_next_assistant_message_for_openai_chat()
         output["messages"],
         json!([
             {"role": "user", "content": "Check the file"},
-            {"role": "assistant", "content": "Let me check."}
+            {
+                "role": "assistant",
+                "content": "Let me check.",
+                "reasoning": "Reading."
+            }
         ])
     );
+    Ok(())
+}
+
+#[test]
+fn openai_chat_reasoning_details_round_trip_in_assistant_history() -> TestResult {
+    let engine = TranslationEngine::default();
+    // Exercise the normalized IR path instead of replaying the original JSON.
+    let policy = normalized_policy();
+    let details = json!([
+        {
+            "type": "reasoning.summary",
+            "summary": "Inspect the environment.",
+            "id": "reasoning-1",
+            "format": "openai-responses-v1",
+            "index": 0
+        },
+        {
+            "type": "reasoning.encrypted",
+            "data": "opaque-encrypted-reasoning",
+            "id": "reasoning-1",
+            "format": "openai-responses-v1",
+            "index": 1
+        }
+    ]);
+    let body = json!({
+        "model": REASONING_MODEL,
+        "messages": [
+            {"role": "user", "content": "Inspect the environment"},
+            {
+                "role": "assistant",
+                "content": null,
+                "reasoning": "fallback text",
+                "reasoning_details": details,
+                "tool_calls": [shell_tool_call()]
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": "/workspace"}
+        ]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiChat,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    assert_eq!(output["messages"][1]["reasoning_details"], details);
+    assert!(output["messages"][1].get("reasoning").is_none());
+    assert_eq!(output["messages"][1]["tool_calls"][0]["id"], "call-1");
+    Ok(())
+}
+
+#[test]
+fn openai_chat_encrypted_reasoning_details_retain_fallback() -> TestResult {
+    let engine = TranslationEngine::default();
+    let policy = normalized_policy();
+    let details = json!([{
+        "type": "reasoning.encrypted",
+        "data": "opaque-encrypted-reasoning",
+        "id": "reasoning-1",
+        "format": "openai-responses-v1",
+        "index": 0
+    }]);
+    let body = json!({
+        "model": REASONING_MODEL,
+        "messages": [{
+            "role": "assistant",
+            "content": null,
+            "reasoning": "fallback text",
+            "reasoning_details": details
+        }]
+    });
+
+    let output = engine
+        .translate_request(
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiChat,
+            &body,
+            &policy,
+        )?
+        .body;
+
+    assert_eq!(output["messages"][0]["reasoning_details"], details);
+    assert_eq!(output["messages"][0]["reasoning"], "fallback text");
     Ok(())
 }
 
